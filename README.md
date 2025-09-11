@@ -1,70 +1,124 @@
 # ArtNetLab
 
-ArtNetLab is a Tauri (Rust) desktop app that provides two core tools:
+ArtNetLab is a modern Tauri (Rust) desktop application for professional DMX lighting control and monitoring. Built with React and TypeScript frontend and Rust backend, it provides comprehensive Art-Net tools for lighting professionals.
 
-- Art-Net Monitor: real-time view of incoming ArtDMX values (0–511).
-- Art-Net Sender: 512 vertical faders to control a universe. Default send rate 44 Hz (configurable).
+## Features
 
-- Record/Play: capture incoming ArtDMX to a JSON Lines file and play it back.
+### 🎛️ Art-Net Sender
+- **512 Individual Faders**: Full DMX universe control with vertical sliders
+- **Dual Input Methods**: 
+  - Custom vertical sliders with smooth dragging
+  - Numeric input fields with validation (0-255)
+- **Master Control**: Global master fader with real-time scaling
+- **Animation Engine**: Built-in animation patterns
+  - **Sinusoid**: Smooth sine wave patterns
+  - **Ramp**: Linear ramp up/down
+  - **Square**: On/off square wave patterns
+  - **Off**: Resets all channels to zero
+- **Frequency Control**: Adjustable animation speed (0-100 Hz)
+- **Quick Actions**: "All 0" and "All 255" buttons for instant testing
+- **Real-time Feedback**: Visual sending indicator with LED-style blinking
+- **Configurable Output**: Customizable target IP, port, net, subnet, and universe
+- **Variable Send Rate**: Configurable FPS (default 44 Hz)
 
-Each tab has a settings dialog to configure IP/port (monitor) and target IP/port/net/subnet/universe/frequency (sender). Settings persist locally.
+### 📊 Art-Net Monitor
+- **Real-time Visualization**: Live grid display of incoming DMX values
+- **Multi-Universe Support**: Monitor multiple universes simultaneously
+- **Interactive Tooltips**: Hover over channels for detailed information
+  - Current channel value
+  - 10-second history graph with oscilloscope-style visualization
+  - Frame count and timing data
+- **Universe Tabs**: Easy switching between active universes
+- **Auto-cleanup**: Automatically removes inactive universes after 10 seconds
+- **Color-coded Display**: Visual intensity representation
+- **Responsive Layout**: Adapts to window size with optimal channel grid
 
----
+### �� Record & Playback
+- **JSON Lines Format**: Industry-standard recording format
+- **Frame-perfect Timing**: Preserves original timing and sequencing
+- **Universe Preservation**: Maintains net/subnet/universe addressing
+- **Real-time Recording**: Captures incoming Art-Net data during monitoring
+- **Playback Control**: Start/stop playback with original timing
+- **File Management**: Easy file selection and management
+
+### ⚙️ Advanced Configuration
+- **Persistent Settings**: All configurations saved locally
+- **Network Configuration**:
+  - Monitor: Bind IP and port settings
+  - Sender: Target IP, port, net, subnet, universe, and frequency
+- **Art-Net Compliance**: Full Art-Net 4 protocol support
+- **Cross-platform**: Works on macOS, Windows, and Linux
+
+### 🎨 User Interface
+- **Modern Design**: Clean, professional interface
+- **Tabbed Navigation**: Easy switching between Monitor, Sender, and Record/Play
+- **Responsive Layout**: Adapts to different screen sizes
+- **Keyboard Support**: Full keyboard navigation for sliders
+- **Accessibility**: ARIA labels and screen reader support
+- **Performance Optimized**: Smooth 60 FPS animations and updates
+
+## Technical Specifications
+
+- **Protocol**: Art-Net 4 (ArtDMX)
+- **DMX Channels**: 512 channels per universe
+- **Network**: UDP broadcast/unicast
+- **Default Port**: 6454
+- **Frame Rate**: Configurable (default 44 Hz)
+- **Animation Rate**: 60 FPS internal
+- **Recording Format**: JSON Lines (.jsonl)
+- **History Buffer**: 10-second rolling buffer per channel
 
 ## Build & Run
 
-Prereqs: Rust stable, Tauri CLI 2.x.
+### Prerequisites
+- Rust stable
+- Tauri CLI 2.x
+- Node.js (for development)
 
-macOS/Linux
-
+### Development
 ```bash
-# inside the repo root
+# Install dependencies
+pnpm install
+
+# Start development server
 cargo tauri dev
 ```
 
-Release build
-
+### Production Build
 ```bash
+# Build for production
 cargo tauri build
 ```
 
-The app serves static UI from `ui/` (no Node or npm needed).
-
----
-
 ## Usage
 
-- Monitor tab
-  - Open settings (gear) to set bind IP and port (default 0.0.0.0:6454).
-  - Click “Start Monitor”. Cells reflect channel intensity and value.
+### Monitor Tab
+1. Click the gear icon to open settings
+2. Configure bind IP and port (default: 0.0.0.0:6454)
+3. Click "Start Monitor" to begin receiving
+4. Hover over channels to see detailed tooltips with history graphs
+5. Use universe tabs to switch between active universes
 
-- Sender tab
-  - Open settings (knobs) to set target IP/port and addressing (net/subnet/universe) and Frequency (Hz).
-  - Move faders; changes are throttled and sent as ArtDMX frames at your configured rate.
-  - Use “All 0” / “All 255” for quick tests.
+### Sender Tab
+1. Click the gear icon to configure target settings
+2. Set target IP, port, net, subnet, universe, and frequency
+3. Use individual faders or numeric inputs to control channels
+4. Adjust master fader for global scaling
+5. Select animation mode and frequency for automated patterns
+6. Click "Start Sender" to begin transmission
+7. Use "All 0" / "All 255" for quick testing
 
-- Record/Play tab
-  - Record to...: choose a file to write JSON Lines (.jsonl). First line is a header, then one frame per line: { t_ms, net, subnet, universe, length, values }.
-  - Open File: pick an existing .jsonl recording.
-  - Play: replays with original timing to your current Sender target (per-frame net/subnet/universe is preserved).
-  - Stop Rec / Stop Play: end recording or playback.
+### Record/Play Tab
+1. **Recording**: Click "Record to..." to choose output file
+2. **Playback**: Click "Open File" to select existing recording
+3. **Play**: Start playback with original timing
+4. **Stop**: End recording or playback as needed
 
-Notes
+## Network Configuration
 
-- Default port is 6454. Sender defaults to broadcast 255.255.255.255.
-- Universe addressing follows Art-Net: SubUni = (subnet << 4) | universe; Net is separate.
-- The sender runs at a configurable frequency (default 44 Hz).
+- **Default Port**: 6454 (Art-Net standard)
+- **Sender Default**: Broadcast to 255.255.255.255
+- **Universe Addressing**: Follows Art-Net specification (SubUni = subnet << 4 | universe)
+- **Firewall**: Ensure UDP port 6454 is open for your network interface
 
----
-
-## Structure
-
-- `src-tauri/` Rust backend: UDP Art-Net send/receive and Tauri commands.
-- `ui/` static frontend: vanilla HTML/CSS/JS.
-- `tauri.conf.json` Tauri v2 config with global Tauri API enabled and dialog plugin.
-
----
-
-## Security & Networking
-
-Art-Net uses UDP broadcast by default. Ensure your OS firewall allows UDP/6454 for your network interface. For unicast, set the Sender target IP to the device address.
+## File Structure

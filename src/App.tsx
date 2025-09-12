@@ -29,10 +29,19 @@ function App() {
   useEffect(() => {
     invoke("load_settings")
       .then((s: any) => {
-        if (s?.receiver) setMonCfg(s.receiver);
-        if (s?.sender) setSndCfg(s.sender);
+        console.log("Loaded settings:", s);
+        if (s?.receiver) {
+          console.log("Setting receiver config:", s.receiver);
+          setMonCfg(s.receiver);
+        }
+        if (s?.sender) {
+          console.log("Setting sender config:", s.sender);
+          setSndCfg(s.sender);
+        }
       })
-      .catch(() => {});
+      .catch((e) => {
+        console.error("Failed to load settings:", e);
+      });
   }, []);
 
   // Auto-start monitor on app open (backend also autostarts; this ensures it runs even if settings aren't loaded yet)
@@ -85,25 +94,28 @@ function App() {
     masterRef.current = masterValue;
   }, [masterValue]);
 
-  const onFader = useCallback((i: number, v: number) => {
-    setFaders((prev) => {
-      if (prev[i] === v) return prev;
-      const n = prev.slice();
-      n[i] = v;
-      return n;
-    });
-    if (sendTimer) return Promise.resolve();
-    const id = window.setTimeout(() => {
-      setSendTimer(null);
-      const src = fadersRef.current;
-      const m = masterRef.current;
-      const scaled = src.map((val) => Math.round((val * m) / 255));
-      invoke("set_channels", { values: scaled }).catch(() => {});
-      invoke("push_frame").catch(() => {});
-    }, 30);
-    setSendTimer(id);
-    return Promise.resolve();
-  }, [sendTimer]);
+  const onFader = useCallback(
+    (i: number, v: number) => {
+      setFaders((prev) => {
+        if (prev[i] === v) return prev;
+        const n = prev.slice();
+        n[i] = v;
+        return n;
+      });
+      if (sendTimer) return Promise.resolve();
+      const id = window.setTimeout(() => {
+        setSendTimer(null);
+        const src = fadersRef.current;
+        const m = masterRef.current;
+        const scaled = src.map((val) => Math.round((val * m) / 255));
+        invoke("set_channels", { values: scaled }).catch(() => {});
+        invoke("push_frame").catch(() => {});
+      }, 30);
+      setSendTimer(id);
+      return Promise.resolve();
+    },
+    [sendTimer]
+  );
 
   const onInputChange = (i: number, value: string) => {
     const numValue = Number(value);

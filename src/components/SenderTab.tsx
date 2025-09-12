@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import Slider from "./ui/Slider";
 
 // Constants
@@ -10,6 +11,13 @@ const ANIMATION_INTERVAL = 1000 / ANIMATION_FPS;
 
 // Types
 type AnimationMode = "sinusoid" | "ramp" | "square" | "off";
+
+type Frame = {
+  values: number[];
+  net: number;
+  subnet: number;
+  universe: number;
+};
 
 interface SenderTabProps {
   faders: number[];
@@ -89,67 +97,48 @@ const useAnimation = (
   setFaders: (faders: number[]) => void,
   masterValue: number
 ) => {
-  const generateAnimationValues = useCallback(
-    (time: number, mode: string, freq: number) => {
-      const values = new Array(DMX_CHANNELS).fill(0);
-      const period = 1000 / freq;
-      const t = (time % period) / period;
-
-      let value = 0;
-      switch (mode) {
-        case "sinusoid":
-          value = (Math.sin(2 * Math.PI * t) + 1) / 2;
-          break;
-        case "ramp":
-          value = t;
-          break;
-        case "square":
-          value = Math.sin(2 * Math.PI * t) > 0 ? 1 : 0;
-          break;
-        default:
-          value = 0;
-      }
-
-      const dmxValue = Math.round(value * DMX_MAX_VALUE);
-      return values.fill(dmxValue);
-    },
-    []
-  );
-
   useEffect(() => {
     if (animationMode === "off") {
+      invoke("stop_animation");
       const zeroValues = new Array(DMX_CHANNELS).fill(0);
       setFaders(zeroValues);
       invoke("set_channels", { values: zeroValues });
-      invoke("push_frame");
       return;
     }
 
-    const animate = () => {
-      const currentTime = Date.now();
-      const values = generateAnimationValues(
-        currentTime,
-        animationMode,
-        animationFreq
-      );
+    // Start backend animation
+    invoke("start_animation", {
+      mode: animationMode,
+      frequency: animationFreq,
+      masterValue: masterValue,
+    });
 
-      // Apply master scaling to animation values
-      const scaledValues = applyMasterScaling(values, masterValue);
-
-      setFaders(scaledValues);
-      invoke("set_channels", { values: scaledValues });
-      invoke("push_frame");
+    return () => {
+      invoke("stop_animation");
     };
+  }, [animationMode, animationFreq, masterValue]);
 
-    const interval = setInterval(animate, ANIMATION_INTERVAL);
-    return () => clearInterval(interval);
-  }, [
-    animationMode,
-    animationFreq,
-    setFaders,
-    generateAnimationValues,
-    masterValue,
-  ]);
+  // Listen for DMX frames to update faders during animation
+  useEffect(() => {
+    if (animationMode === "off") return;
+
+    const unlisten = listen<Frame>("artnet:dmx", (e) => {
+      const frame = e.payload;
+      if (!frame) return;
+
+      // Update faders with the received DMX values
+      const values = frame.values || [];
+      const faderValues = new Array(DMX_CHANNELS).fill(0);
+      for (let i = 0; i < Math.min(DMX_CHANNELS, values.length); i++) {
+        faderValues[i] = values[i];
+      }
+      setFaders(faderValues);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [animationMode, setFaders]);
 };
 
 export default function SenderTab({

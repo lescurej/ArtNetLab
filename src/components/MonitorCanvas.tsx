@@ -142,6 +142,7 @@ export default function MonitorCanvas() {
   const [universes, setUniverses] = useState<string[]>([]);
   const [selected, setSelected] = useState<string>("");
   const universeLastSeenRef = useRef<Map<string, number>>(new Map());
+  const universeSeenCountRef = useRef<Map<string, number>>(new Map());
   const [hoveredChannel, setHoveredChannel] = useState<number | null>(null);
   const currentBufRef = useRef<Uint8Array>(new Uint8Array(512));
   const [mousePos, setMousePos] = useState<{ x: number; y: number }>({
@@ -323,8 +324,13 @@ export default function MonitorCanvas() {
       // Mark last-seen for this universe and ensure it's listed
       const now = Date.now();
       universeLastSeenRef.current.set(key, now);
-      setUniverses((u) => (u.includes(key) ? u : [...u, key]));
-      if (!selected) setSelected(key);
+      // require at least 2 frames before listing to avoid transient ghosts
+      const cnt = (universeSeenCountRef.current.get(key) || 0) + 1;
+      universeSeenCountRef.current.set(key, cnt);
+      if (cnt >= 2) {
+        setUniverses((u) => (u.includes(key) ? u : [...u, key]));
+        if (!selected) setSelected(key);
+      }
 
       // Only update display for the selected universe
       const target = !selected || key === selected;
@@ -371,6 +377,7 @@ export default function MonitorCanvas() {
           // Cleanup lastSeen entries
           for (const k of prev) {
             if (!keep.includes(k)) universeLastSeenRef.current.delete(k);
+            if (!keep.includes(k)) universeSeenCountRef.current.delete(k);
           }
           // Fix selection if removed
           if (selected && !keep.includes(selected)) {

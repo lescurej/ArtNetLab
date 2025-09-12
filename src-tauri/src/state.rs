@@ -10,6 +10,26 @@ use tokio::{
 use crate::artnet::{self, ReceiverConfig, SenderConfig};
 use tauri::Emitter;
 
+// Animation state
+#[derive(Clone)]
+pub struct AnimationState {
+    pub mode: String,
+    pub frequency: f64,
+    pub master_value: u8,
+    pub is_running: bool,
+}
+
+impl Default for AnimationState {
+    fn default() -> Self {
+        Self {
+            mode: "off".to_string(),
+            frequency: 1.0,
+            master_value: 255,
+            is_running: false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
@@ -29,8 +49,11 @@ struct Inner {
     record_task: Option<JoinHandle<()>>,
     // Playback
     play_task: Option<JoinHandle<()>>,
-    // Event filter for filtered event stream
-    event_filter: Option<(u8, u8, u8)>, // (net, subnet, universe)
+    // Animation
+    animation_state: AnimationState,
+    animation_task: Option<JoinHandle<()>>,
+    // Event filter
+    event_filter: Option<(u8, u8, u8)>,
 }
 
 impl Default for AppState {
@@ -46,6 +69,8 @@ impl Default for AppState {
                 record_tx: None,
                 record_task: None,
                 play_task: None,
+                animation_state: AnimationState::default(),
+                animation_task: None,
                 event_filter: None,
             })),
         }
@@ -55,6 +80,10 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn inner(&self) -> &Arc<Mutex<Inner>> {
+        &self.inner
     }
 
     pub fn get_receiver_config(&self) -> ReceiverConfig {
@@ -137,6 +166,84 @@ impl AppState {
     pub fn set_event_filter(&self, filter: Option<(u8, u8, u8)>) {
         self.inner.lock().unwrap().event_filter = filter;
     }
+
+    // Animation controls
+    pub fn set_animation_task(&self, task: JoinHandle<()>) {
+        self.inner.lock().unwrap().animation_task = Some(task);
+    }
+
+    pub fn stop_animation(&self) {
+        if let Some(handle) = self.inner.lock().unwrap().animation_task.take() {
+            handle.abort();
+        }
+        self.inner.lock().unwrap().animation_state.is_running = false;
+    }
+
+    pub fn set_animation_state(&self, state: AnimationState) {
+        self.inner.lock().unwrap().animation_state = state;
+    }
+}
+
+// Animation generation function
+fn generate_animation_values(time_ms: u64, mode: &str, freq: f64) -> [u8; 512] {
+    let mut values = [0u8; 512];
+    let period_ms = (1000.0 / freq) as u64;
+    let t = (time_ms % period_ms) as f64 / period_ms as f64;
+
+    let value = match mode {
+        "sinusoid" => ((2.0 * std::f64::consts::PI * t).sin() + 1.0) / 2.0,
+        "ramp" => t,
+        "square" => {
+            if (2.0 * std::f64::consts::PI * t).sin() > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    };
+
+    let dmx_value = (value * 255.0).round() as u8;
+    values.fill(dmx_value);
+    values
+}
+
+fn apply_master_scaling(values: &[u8; 512], master: u8) -> [u8; 512] {
+    let mut scaled = [0u8; 512];
+    for (i, &value) in values.iter().enumerate() {
+        scaled[i] = ((value as u16 * master as u16) / 255) as u8;
+    }
+    scaled
+}
+
+// Animation task
+pub async fn run_animation_task(app_state: AppState) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_millis(16)); // 60 FPS
+
+    loop {
+        interval.tick().await;
+
+        let animation = {
+            let inner = app_state.inner.lock().unwrap();
+            inner.animation_state.clone()
+        };
+
+        if !animation.is_running || animation.mode == "off" {
+            continue;
+        }
+
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let values = generate_animation_values(current_time, &animation.mode, animation.frequency);
+        let scaled_values = apply_master_scaling(&values, animation.master_value);
+
+        // Update channels and send
+        app_state.set_channels(&scaled_values);
+        // Note: push_frame is handled by the sender task, not here
+    }
 }
 
 pub async fn run_receiver_task(
@@ -155,7 +262,9 @@ pub async fn run_receiver_task(
             // Optional filtered stream
             let filter = { app_state.inner.lock().unwrap().event_filter };
             let pass = match filter {
-                Some((net, sub, uni)) => frame.net == net && frame.subnet == sub && frame.universe == uni,
+                Some((net, sub, uni)) => {
+                    frame.net == net && frame.subnet == sub && frame.universe == uni
+                }
                 None => true,
             };
             if pass {

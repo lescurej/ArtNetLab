@@ -131,14 +131,22 @@ fn load_settings(
     state: tauri::State<AppState>,
 ) -> Result<SettingsFile, String> {
     let path = settings_path(&app);
-    if let Ok(bytes) = fs::read(path) {
+    println!("Loading settings from: {:?}", path);
+    if let Ok(bytes) = fs::read(&path) {
+        println!("Read {} bytes from settings file", bytes.len());
         if let Ok(cfg) = serde_json::from_slice::<SettingsFile>(&bytes) {
+            println!("Successfully parsed settings: {:?}", cfg);
             state.set_receiver_config(cfg.receiver.clone());
             state.set_sender_config(cfg.sender.clone());
             return Ok(cfg);
+        } else {
+            println!("Failed to parse settings JSON");
         }
+    } else {
+        println!("Failed to read settings file");
     }
     let def = SettingsFile::default();
+    println!("Returning default settings: {:?}", def);
     Ok(def)
 }
 
@@ -181,7 +189,11 @@ fn stop_playback(state: tauri::State<AppState>) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EventFilter { net: u8, subnet: u8, universe: u8 }
+struct EventFilter {
+    net: u8,
+    subnet: u8,
+    universe: u8,
+}
 
 #[tauri::command]
 fn set_event_filter(state: tauri::State<AppState>, filter: Option<EventFilter>) {
@@ -196,7 +208,52 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
 
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|e| e.to_string())
+    println!("Reading text file from: {}", path);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            println!("Successfully read {} characters from file", content.len());
+            Ok(content)
+        }
+        Err(e) => {
+            println!("Failed to read file: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+async fn start_animation(
+    state: tauri::State<'_, AppState>,
+    mode: String,
+    frequency: f64,
+    master_value: u8,
+) -> Result<(), String> {
+    // Stop existing animation
+    state.stop_animation();
+
+    // Update animation state - use existing methods
+    state.set_animation_state(state::AnimationState {
+        mode,
+        frequency,
+        master_value,
+        is_running: true,
+    });
+
+    // Start new animation task
+    let app_state = state.inner().clone();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = state::run_animation_task(app_state).await {
+            eprintln!("Animation task error: {e:?}");
+        }
+    });
+
+    state.set_animation_task(handle);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_animation(state: tauri::State<AppState>) {
+    state.stop_animation();
 }
 
 fn main() {
@@ -242,7 +299,9 @@ fn main() {
             stop_playback,
             set_event_filter,
             write_text_file,
-            read_text_file
+            read_text_file,
+            start_animation,
+            stop_animation
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

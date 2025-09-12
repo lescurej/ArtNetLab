@@ -106,11 +106,28 @@
         .emoji {
             margin-right: 0.5em;
         }
+
+        .app-icon {
+            width: 64px;
+            height: 64px;
+            margin-right: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 2em;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>ArtNetLab</h1>
+        <div class="header">
+            <img src="favicon.png" alt="ArtNetLab Icon" class="app-icon">
+            <h1>ArtNetLab</h1>
+        </div>
         
         <p>ArtNetLab is a modern desktop application for professional DMX lighting control and monitoring. Built with React and TypeScript frontend and Rust backend, it provides comprehensive Art-Net tools for lighting professionals.</p>
 

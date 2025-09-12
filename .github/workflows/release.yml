@@ -9,6 +9,9 @@ jobs:
   tauri:
     name: Build and Release
     runs-on: ${{ matrix.platform }}
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,29 +39,36 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux build dependencies
-        if: matrix.platform == 'ubuntu-latest'
+        if: ${{ matrix.platform == 'ubuntu-latest' }}
         run: |
           sudo apt-get update
+          # Try webkit2gtk 4.1, fall back to 4.0 if unavailable
           sudo apt-get install -y \
             libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            libwebkit2gtk-4.1-dev || \
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libwebkit2gtk-4.0-dev
 
       - name: Install WiX Toolset (Windows)
-        if: matrix.platform == 'windows-latest'
+        if: ${{ matrix.platform == 'windows-latest' }}
         run: choco install wixtoolset -y
 
       - name: Import Apple code-signing certificate (macOS)
-        if: runner.os == 'macOS' && secrets.MACOS_CERT_P12 != '' && secrets.MACOS_CERT_PASSWORD != ''
+        if: ${{ runner.os == 'macOS' && env.MACOS_CERT_P12 != '' && env.MACOS_CERT_PASSWORD != '' }}
         uses: apple-actions/import-codesign-certs@v3
         with:
-          p12-file-base64: ${{ secrets.MACOS_CERT_P12 }}
-          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+          p12-file-base64: ${{ env.MACOS_CERT_P12 }}
+          p12-password: ${{ env.MACOS_CERT_PASSWORD }}
 
       - name: List available code signing identities (macOS)
-        if: runner.os == 'macOS'
+        if: ${{ runner.os == 'macOS' }}
         run: security find-identity -v -p codesigning || true
 
       - name: Build and upload release artifacts with Tauri

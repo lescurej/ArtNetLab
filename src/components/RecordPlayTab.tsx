@@ -40,6 +40,9 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const [blink, setBlink] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<SenderConfig | null>(null);
+  const [recordingFormat, setRecordingFormat] = useState<"jsonl" | "wav">(
+    "jsonl"
+  );
 
   // Data buffers: timestamps and per-channel arrays of values
   const tRef = useRef<number[]>([]);
@@ -310,7 +313,11 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const chooseOpen = useCallback(async () => {
     const p = await dialogOpen({
       multiple: false,
-      filters: [{ name: "ArtNet JSONL", extensions: ["jsonl", "json"] }],
+      filters: [
+        { name: "ArtNet Files", extensions: ["jsonl", "json", "wav"] },
+        { name: "ArtNet JSONL", extensions: ["jsonl", "json"] },
+        { name: "ArtNet WAV", extensions: ["wav"] },
+      ],
     });
     if (!p) return;
     const newPath = String(p);
@@ -319,40 +326,63 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       !window.confirm("Discard current unsaved recording and load file?")
     )
       return;
-    const content = (await invoke("read_text_file", {
-      path: newPath,
-    })) as string;
-    console.log("Loaded file content length:", content.length);
-    tRef.current = [];
-    bufRef.current = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
-    vizTRef.current = [];
-    vizBufRef.current = Array.from(
-      { length: CHANNELS },
-      () => new Uint8Array(0)
-    );
-    const lines = content.split(/\r?\n/).filter(Boolean);
-    let i = 0;
-    if (
-      lines[0] &&
-      lines[0].includes("format") &&
-      lines[0].includes("artnet-jsonl")
-    )
-      i = 1;
-    let loadedKey: UniverseKey | "" = "";
-    for (; i < lines.length; i++) {
-      const obj = JSON.parse(lines[i]);
-      const t_ms = obj.t_ms as number;
-      const values = obj.values as number[];
-      if (!loadedKey && obj && typeof obj.net === "number") {
-        loadedKey = `${obj.net | 0}/${obj.subnet | 0}/${obj.universe | 0}`;
-      }
-      tRef.current.push(t_ms);
+    // Detect file format and load accordingly
+    const isWavFile = newPath.toLowerCase().endsWith(".wav");
+
+    if (isWavFile) {
+      // Load WAV file
+      const wavData = (await invoke("load_wav_recording", {
+        path: newPath,
+      })) as any;
+
+      console.log("Loaded WAV file with", wavData.timestamps.length, "frames");
+
+      // Populate buffers from WAV data
+      tRef.current = wavData.timestamps;
       for (let ch = 0; ch < CHANNELS; ch++) {
-        const prev = bufRef.current[ch];
-        const next = new Uint8Array(prev.length + 1);
-        if (prev.length) next.set(prev, 0);
-        next[prev.length] = values[ch] | 0;
-        bufRef.current[ch] = next;
+        bufRef.current[ch] = new Uint8Array(wavData.channels[ch] || []);
+      }
+    } else {
+      // Load JSONL file
+      const content = (await invoke("read_text_file", {
+        path: newPath,
+      })) as string;
+      console.log("Loaded file content length:", content.length);
+
+      tRef.current = [];
+      bufRef.current = Array.from(
+        { length: CHANNELS },
+        () => new Uint8Array(0)
+      );
+      vizTRef.current = [];
+      vizBufRef.current = Array.from(
+        { length: CHANNELS },
+        () => new Uint8Array(0)
+      );
+      const lines = content.split(/\r?\n/).filter(Boolean);
+      let i = 0;
+      if (
+        lines[0] &&
+        lines[0].includes("format") &&
+        lines[0].includes("artnet-jsonl")
+      )
+        i = 1;
+      let loadedKey: UniverseKey | "" = "";
+      for (; i < lines.length; i++) {
+        const obj = JSON.parse(lines[i]);
+        const t_ms = obj.t_ms as number;
+        const values = obj.values as number[];
+        if (!loadedKey && obj && typeof obj.net === "number") {
+          loadedKey = `${obj.net | 0}/${obj.subnet | 0}/${obj.universe | 0}`;
+        }
+        tRef.current.push(t_ms);
+        for (let ch = 0; ch < CHANNELS; ch++) {
+          const prev = bufRef.current[ch];
+          const next = new Uint8Array(prev.length + 1);
+          if (prev.length) next.set(prev, 0);
+          next[prev.length] = values[ch] | 0;
+          bufRef.current[ch] = next;
+        }
       }
     }
 
@@ -411,44 +441,72 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
 
   const saveToFile = useCallback(async () => {
     if (tRef.current.length === 0) return;
+    const extension = recordingFormat === "wav" ? "wav" : "jsonl";
     const p = await dialogSave({
-      defaultPath: "recording.jsonl",
-      filters: [{ name: "JSON Lines", extensions: ["jsonl"] }],
+      defaultPath: `recording.${extension}`,
+      filters: [
+        { name: "ArtNet JSONL", extensions: ["jsonl"] },
+        { name: "ArtNet WAV", extensions: ["wav"] },
+      ],
     });
     if (!p) return;
-    const t0 = tRef.current[0];
-    const lines: string[] = [];
-    lines.push(JSON.stringify({ format: "artnet-jsonl", version: 1 }));
-    for (let i = 0; i < tRef.current.length; i++) {
-      const t_ms = tRef.current[i] - t0;
-      const values = new Array(CHANNELS);
-      for (let ch = 0; ch < CHANNELS; ch++)
-        values[ch] = bufRef.current[ch][i] | 0;
-      // Include addressing of the selected universe if available
-      let net = 0,
-        subnet = 0,
-        universe = 0;
-      if (selected) {
-        const [n, s, u] = selected.split("/").map((v) => Number(v) | 0);
-        net = n;
-        subnet = s;
-        universe = u;
-      }
-      lines.push(
-        JSON.stringify({
-          t_ms,
-          net,
-          subnet,
-          universe,
-          length: CHANNELS,
-          values,
-        })
+
+    if (recordingFormat === "wav") {
+      // Save as WAV format
+      const t0 = tRef.current[0];
+      const duration = tRef.current[tRef.current.length - 1] - t0;
+      const sampleRate = Math.max(
+        1,
+        Math.floor((tRef.current.length * 1000) / duration)
       );
+
+      await invoke("save_wav_recording", {
+        path: String(p),
+        sampleRate,
+        data: {
+          timestamps: tRef.current.map((t) => t - t0),
+          channels: Array.from({ length: CHANNELS }, (_, ch) =>
+            Array.from(bufRef.current[ch])
+          ),
+        },
+      });
+    } else {
+      // Save as JSONL format
+      const t0 = tRef.current[0];
+      const lines: string[] = [];
+      lines.push(JSON.stringify({ format: "artnet-jsonl", version: 1 }));
+      for (let i = 0; i < tRef.current.length; i++) {
+        const t_ms = tRef.current[i] - t0;
+        const values = new Array(CHANNELS);
+        for (let ch = 0; ch < CHANNELS; ch++)
+          values[ch] = bufRef.current[ch][i] | 0;
+        // Include addressing of the selected universe if available
+        let net = 0,
+          subnet = 0,
+          universe = 0;
+        if (selected) {
+          const [n, s, u] = selected.split("/").map((v) => Number(v) | 0);
+          net = n;
+          subnet = s;
+          universe = u;
+        }
+        lines.push(
+          JSON.stringify({
+            t_ms,
+            net,
+            subnet,
+            universe,
+            length: CHANNELS,
+            values,
+          })
+        );
+      }
+      const content = lines.join("\n") + "\n";
+      await invoke("write_text_file", { path: String(p), content });
     }
-    const content = lines.join("\n") + "\n";
-    await invoke("write_text_file", { path: String(p), content });
+
     setPath(String(p));
-  }, [selected]);
+  }, [selected, recordingFormat]);
 
   const togglePlay = useCallback(async () => {
     if (!isPlaying) {
@@ -457,7 +515,14 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         return;
       }
       setIsPlaying(true);
-      await invoke("play_file", { path });
+
+      // Detect format and play accordingly
+      const isWavFile = path.toLowerCase().endsWith(".wav");
+      if (isWavFile) {
+        await invoke("play_wav_file", { path });
+      } else {
+        await invoke("play_file", { path });
+      }
     } else {
       await invoke("stop_playback");
       setIsPlaying(false);
@@ -533,6 +598,17 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
                 {u}
               </option>
             ))}
+          </select>
+          <label className="animation-label">Format:</label>
+          <select
+            value={recordingFormat}
+            onChange={(e) =>
+              setRecordingFormat(e.target.value as "jsonl" | "wav")
+            }
+            className="animation-select"
+          >
+            <option value="jsonl">JSONL (Text)</option>
+            <option value="wav">WAV (Binary)</option>
           </select>
           <span
             title={blink ? "DMX activity" : "No recent frames"}

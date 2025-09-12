@@ -373,3 +373,32 @@ pub async fn run_play_task(path: String, cfg: SenderConfig) -> Result<()> {
     }
     Ok(())
 }
+
+// WAV playback task
+pub async fn run_wav_play_task(wav_data: crate::WavRecordingData, cfg: SenderConfig) -> Result<()> {
+    let sock = artnet::sender_socket().await?;
+    let mut last_t: Option<u64> = None;
+
+    for frame_idx in 0..wav_data.timestamps.len() {
+        let t_ms = wav_data.timestamps[frame_idx];
+
+        if let Some(prev) = last_t {
+            let delta = t_ms.saturating_sub(prev);
+            if delta > 0 {
+                sleep(Duration::from_millis(delta)).await;
+            }
+        }
+        last_t = Some(t_ms);
+
+        // Create DMX frame from WAV data
+        let mut arr = [0u8; 512];
+        for ch in 0..512 {
+            if ch < wav_data.channels.len() && frame_idx < wav_data.channels[ch].len() {
+                arr[ch] = wav_data.channels[ch][frame_idx];
+            }
+        }
+
+        let _ = artnet::send_artdmx(&sock, &cfg, &arr, 0).await;
+    }
+    Ok(())
+}

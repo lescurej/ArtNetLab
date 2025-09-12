@@ -221,6 +221,238 @@ fn read_text_file(path: String) -> Result<String, String> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct WavRecordingData {
+    pub timestamps: Vec<u64>,
+    pub channels: Vec<Vec<u8>>,
+}
+
+#[tauri::command]
+fn save_wav_recording(
+    path: String,
+    sample_rate: u32,
+    data: WavRecordingData,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    println!(
+        "Saving WAV recording to: {} ({} frames, {} Hz)",
+        path,
+        data.timestamps.len(),
+        sample_rate
+    );
+
+    let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+
+    // WAV header
+    let num_channels = 512u16; // 512 DMX channels
+    let bits_per_sample = 8u16;
+    let bytes_per_sample = bits_per_sample / 8;
+    let block_align = num_channels * bytes_per_sample;
+    let sample_rate = sample_rate as u32;
+    let byte_rate = sample_rate * block_align as u32;
+    let data_size = (data.timestamps.len() as u32) * block_align as u32;
+    let file_size = 36 + data_size;
+
+    // RIFF header
+    file.write_all(b"RIFF").map_err(|e| e.to_string())?;
+    file.write_all(&file_size.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(b"WAVE").map_err(|e| e.to_string())?;
+
+    // fmt chunk
+    file.write_all(b"fmt ").map_err(|e| e.to_string())?;
+    file.write_all(&16u32.to_le_bytes())
+        .map_err(|e| e.to_string())?; // chunk size
+    file.write_all(&1u16.to_le_bytes())
+        .map_err(|e| e.to_string())?; // PCM format
+    file.write_all(&num_channels.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&sample_rate.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&byte_rate.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&block_align.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&bits_per_sample.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+
+    // data chunk
+    file.write_all(b"data").map_err(|e| e.to_string())?;
+    file.write_all(&data_size.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+
+    // Write sample data (interleaved channels)
+    for frame_idx in 0..data.timestamps.len() {
+        for ch in 0..512 {
+            let value = if ch < data.channels.len() && frame_idx < data.channels[ch].len() {
+                data.channels[ch][frame_idx]
+            } else {
+                0
+            };
+            file.write_all(&[value]).map_err(|e| e.to_string())?;
+        }
+    }
+
+    println!(
+        "Successfully saved WAV file with {} frames",
+        data.timestamps.len()
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
+    use std::io::Read;
+
+    println!("Loading WAV recording from: {}", path);
+
+    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).map_err(|e| e.to_string())?;
+
+    if buffer.len() < 44 {
+        return Err("File too small to be a valid WAV file".to_string());
+    }
+
+    // Parse WAV header
+    let mut pos = 0;
+
+    // Check RIFF header
+    if &buffer[pos..pos + 4] != b"RIFF" {
+        return Err("Invalid RIFF header".to_string());
+    }
+    pos += 4;
+
+    let _file_size = u32::from_le_bytes([
+        buffer[pos],
+        buffer[pos + 1],
+        buffer[pos + 2],
+        buffer[pos + 3],
+    ]);
+    pos += 4;
+
+    if &buffer[pos..pos + 4] != b"WAVE" {
+        return Err("Invalid WAVE header".to_string());
+    }
+    pos += 4;
+
+    // Find fmt chunk
+    let mut sample_rate = 44100u32; // Default sample rate
+    while pos < buffer.len() - 8 {
+        let chunk_id = &buffer[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([
+            buffer[pos + 4],
+            buffer[pos + 5],
+            buffer[pos + 6],
+            buffer[pos + 7],
+        ]);
+        pos += 8;
+
+        if chunk_id == b"fmt " {
+            if chunk_size < 16 {
+                return Err("Invalid fmt chunk size".to_string());
+            }
+
+            let _format = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]);
+            let num_channels = u16::from_le_bytes([buffer[pos + 2], buffer[pos + 3]]);
+            sample_rate = u32::from_le_bytes([
+                buffer[pos + 4],
+                buffer[pos + 5],
+                buffer[pos + 6],
+                buffer[pos + 7],
+            ]);
+            let _byte_rate = u32::from_le_bytes([
+                buffer[pos + 8],
+                buffer[pos + 9],
+                buffer[pos + 10],
+                buffer[pos + 11],
+            ]);
+            let _block_align = u16::from_le_bytes([buffer[pos + 12], buffer[pos + 13]]);
+            let bits_per_sample = u16::from_le_bytes([buffer[pos + 14], buffer[pos + 15]]);
+
+            if num_channels != 512 {
+                return Err(format!("Expected 512 channels, got {}", num_channels));
+            }
+            if bits_per_sample != 8 {
+                return Err(format!(
+                    "Expected 8 bits per sample, got {}",
+                    bits_per_sample
+                ));
+            }
+
+            println!(
+                "WAV: {} channels, {} Hz, {} bits",
+                num_channels, sample_rate, bits_per_sample
+            );
+            pos += chunk_size as usize;
+            break;
+        } else {
+            pos += chunk_size as usize;
+        }
+    }
+
+    // Find data chunk
+    while pos < buffer.len() - 8 {
+        let chunk_id = &buffer[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([
+            buffer[pos + 4],
+            buffer[pos + 5],
+            buffer[pos + 6],
+            buffer[pos + 7],
+        ]);
+        pos += 8;
+
+        if chunk_id == b"data" {
+            // Read sample data
+            let num_frames = chunk_size as usize / 512; // 512 channels per frame
+            let mut timestamps = Vec::new();
+            let mut channels = vec![Vec::new(); 512];
+
+            for frame_idx in 0..num_frames {
+                timestamps.push((frame_idx as u64 * 1000) / sample_rate as u64); // Convert to milliseconds
+
+                for ch in 0..512 {
+                    if pos < buffer.len() {
+                        channels[ch].push(buffer[pos]);
+                        pos += 1;
+                    } else {
+                        channels[ch].push(0);
+                    }
+                }
+            }
+
+            println!("Successfully loaded WAV file with {} frames", num_frames);
+            return Ok(WavRecordingData {
+                timestamps,
+                channels,
+            });
+        } else {
+            pos += chunk_size as usize;
+        }
+    }
+
+    Err("No data chunk found in WAV file".to_string())
+}
+
+#[tauri::command]
+async fn play_wav_file(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+    // Stop prior play
+    stop_playback(state.clone());
+
+    // Load WAV data
+    let wav_data = load_wav_recording(path)?;
+    let cfg = state.get_sender_config();
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = state::run_wav_play_task(wav_data, cfg).await {
+            eprintln!("WAV playback error: {e:?}");
+        }
+    });
+    state.set_play_task(handle);
+    Ok(())
+}
+
 #[tauri::command]
 async fn start_animation(
     state: tauri::State<'_, AppState>,
@@ -301,7 +533,10 @@ fn main() {
             write_text_file,
             read_text_file,
             start_animation,
-            stop_animation
+            stop_animation,
+            save_wav_recording,
+            load_wav_recording,
+            play_wav_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

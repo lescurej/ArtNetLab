@@ -283,7 +283,6 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   useEffect(() => {
     const ro = new ResizeObserver(() => {
       if (!containerRef.current) return;
-      const r = containerRef.current.getBoundingClientRect();
       requestAnimationFrame(draw);
     });
     if (containerRef.current) ro.observe(containerRef.current);
@@ -328,6 +327,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       return;
     // Detect file format and load accordingly
     const isWavFile = newPath.toLowerCase().endsWith(".wav");
+    let loadedKey: UniverseKey | "" = "";
 
     if (isWavFile) {
       // Load WAV file
@@ -367,7 +367,6 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         lines[0].includes("artnet-jsonl")
       )
         i = 1;
-      let loadedKey: UniverseKey | "" = "";
       for (; i < lines.length; i++) {
         const obj = JSON.parse(lines[i]);
         const t_ms = obj.t_ms as number;

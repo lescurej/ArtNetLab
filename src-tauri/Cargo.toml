@@ -1,8 +1,8 @@
 [package]
-name = "artnetlab"
+name = "Artnetlab"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A desktop application for professional DMX lighting control and monitoring. It provides comprehensive Art-Net tools for lighting professionals"
+authors = ["Johan Lescure"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

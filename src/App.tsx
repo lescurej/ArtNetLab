@@ -3,11 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import MonitorCanvas from "./components/MonitorCanvas";
 import SenderTab from "./components/SenderTab";
+import RecordPlayTab from "./components/RecordPlayTab";
 
 function App() {
   const [tab, setTab] = useState<"monitor" | "sender" | "recplay">("monitor");
   const [faders, setFaders] = useState<number[]>(Array(512).fill(0));
-  const [path, setPath] = useState("");
+  // path handled within RecordPlayTab now
   const [masterValue, setMasterValue] = useState(255);
   const [senderRunning, setSenderRunning] = useState(false);
 
@@ -121,35 +122,7 @@ function App() {
   };
 
   // Record/Play
-  const chooseOpen = async () => {
-    const dialog = (window as any).__TAURI__?.dialog;
-    const p = await dialog?.open({
-      multiple: false,
-      filters: [{ name: "ArtNet JSONL", extensions: ["jsonl", "json"] }],
-    });
-    if (p) setPath(String(p));
-  };
-  const chooseSave = async () => {
-    const dialog = (window as any).__TAURI__?.dialog;
-    const p = await dialog?.save({
-      defaultPath: "recording.jsonl",
-      filters: [{ name: "JSON Lines", extensions: ["jsonl"] }],
-    });
-    if (p) {
-      setPath(String(p));
-      await invoke("start_recording", { path: String(p) });
-    }
-  };
-
-  const play = async () => {
-    if (path) await invoke("play_file", { path });
-  };
-  const stopPlay = async () => {
-    await invoke("stop_playback");
-  };
-  const stopRec = async () => {
-    await invoke("stop_recording");
-  };
+  // Record/Play controls now handled in RecordPlayTab
 
   return (
     <div className="app">
@@ -219,28 +192,7 @@ function App() {
 
         {/* Record/Play */}
         <section className={`view ${tab === "recplay" ? "active" : ""}`}>
-          <div className="controls">
-            <button className="btn" onClick={chooseOpen}>
-              Open File
-            </button>
-            <button className="btn" onClick={chooseSave}>
-              Record to...
-            </button>
-            <button className="btn" onClick={stopRec}>
-              Stop Rec
-            </button>
-            <button className="btn" onClick={play}>
-              Play
-            </button>
-            <button className="btn danger" onClick={stopPlay}>
-              Stop Play
-            </button>
-            <span className="status">{path}</span>
-          </div>
-          <p className="hint">
-            Format: JSON Lines (.jsonl). First line is a header, then one frame
-            per line with t_ms and values.
-          </p>
+          <RecordPlayTab />
         </section>
       </main>
 

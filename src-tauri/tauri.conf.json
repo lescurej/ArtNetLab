@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "artnetlab",
+  "productName": "Artnetlab",
   "version": "0.1.0",
   "identifier": "com.johanlescure.artnetlab",
   "build": {
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "artnetlab",
+        "title": "Artnetlab",
         "width": 1280,
         "height": 600,
         "resizable": true
@@ -32,6 +32,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "Developer ID Application: Johan Lescure (92RUVKH33H)",
+      "hardenedRuntime": true
+    }
   }
 }

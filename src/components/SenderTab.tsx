@@ -6,8 +6,6 @@ import Slider from "./ui/Slider";
 // Constants
 const DMX_CHANNELS = 512;
 const DMX_MAX_VALUE = 255;
-const ANIMATION_FPS = 60;
-const ANIMATION_INTERVAL = 1000 / ANIMATION_FPS;
 
 // Types
 type AnimationMode = "sinusoid" | "ramp" | "square" | "off";

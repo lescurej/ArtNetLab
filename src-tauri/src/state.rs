@@ -29,6 +29,8 @@ struct Inner {
     record_task: Option<JoinHandle<()>>,
     // Playback
     play_task: Option<JoinHandle<()>>,
+    // Event filter for filtered event stream
+    event_filter: Option<(u8, u8, u8)>, // (net, subnet, universe)
 }
 
 impl Default for AppState {
@@ -44,6 +46,7 @@ impl Default for AppState {
                 record_tx: None,
                 record_task: None,
                 play_task: None,
+                event_filter: None,
             })),
         }
     }
@@ -130,6 +133,10 @@ impl AppState {
             h.abort();
         }
     }
+
+    pub fn set_event_filter(&self, filter: Option<(u8, u8, u8)>) {
+        self.inner.lock().unwrap().event_filter = filter;
+    }
 }
 
 pub async fn run_receiver_task(
@@ -145,6 +152,15 @@ pub async fn run_receiver_task(
 
         if let Ok(frame) = artnet::parse_artdmx(&buf[..n]) {
             let _ = window.emit("artnet:dmx", &frame);
+            // Optional filtered stream
+            let filter = { app_state.inner.lock().unwrap().event_filter };
+            let pass = match filter {
+                Some((net, sub, uni)) => frame.net == net && frame.subnet == sub && frame.universe == uni,
+                None => true,
+            };
+            if pass {
+                let _ = window.emit("artnet:dmx_filtered", &frame);
+            }
             // Forward to recorder if active
             if let Some(tx) = app_state.inner.lock().unwrap().record_tx.clone() {
                 let _ = tx.send(frame);

@@ -13,8 +13,6 @@ type UniverseKey = string; // "net/subnet/universe"
 
 interface RecordPlayTabProps {}
 
-const COLS = 32;
-const ROWS = 16;
 const CHANNELS = 512;
 
 export default function RecordPlayTab(_props: RecordPlayTabProps) {
@@ -32,17 +30,17 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 800, h: 400 });
+  const scrollTopRef = useRef(0);
 
   // Universe discovery and data capture
   useEffect(() => {
     let unlisten: Promise<UnlistenFn> | null = null;
-    unlisten = listen<Frame>("artnet:dmx", (e) => {
+    unlisten = listen<Frame>("artnet:dmx_filtered", (e) => {
       const p = e.payload;
       if (!p) return;
       const key: UniverseKey = `${p.net}/${p.subnet}/${p.universe}`;
       setUniverses((prev) => (prev.includes(key) ? prev : [...prev, key]));
       if (!selected) setSelected(key);
-      if (!selected || key !== selected) return; // capture only selected
 
       // Append snapshot
       const now = Date.now();
@@ -61,6 +59,14 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     return () => {
       unlisten?.then((fn) => fn());
     };
+  }, []);
+
+  // Apply backend filter whenever selection changes
+  useEffect(() => {
+    if (!selected) return;
+    const [n, s, u] = selected.split("/").map((v) => Number(v) | 0);
+    invoke("set_event_filter", { filter: { net: n, subnet: s, universe: u } });
+    return () => { invoke("set_event_filter", { filter: null }); };
   }, [selected]);
 
   // Resize observer
@@ -96,8 +102,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     ctx.fillRect(0, 0, W, H);
 
     const pad = 8;
-    const cellW = (W - pad * 2) / COLS;
-    const cellH = (H - pad * 2) / ROWS;
+    const cellH = 14; // one channel per line
     const xs = tRef.current.length;
     if (xs === 0) {
       // hint text
@@ -112,29 +117,37 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     const tN = tRef.current[xs - 1];
     const span = Math.max(1, tN - t0);
 
+    // Virtualize vertically: draw only visible rows
+    // total height would be CHANNELS * cellH + pad * 2 (virtualized)
+    const scrollTop = scrollTopRef.current;
+    const startRow = Math.max(0, Math.floor((scrollTop - pad) / cellH));
+    const endRow = Math.min(CHANNELS - 1, Math.ceil((scrollTop + H - pad) / cellH));
+
     ctx.lineWidth = 1.2;
-    ctx.strokeStyle = "#70c7ff";
+    for (let ch = startRow; ch <= endRow; ch++) {
+      const y0 = pad + ch * cellH - scrollTop;
+      const ih = cellH - 3;
+      const x0 = pad;
+      const iw = W - pad * 2;
+      // baseline
+      ctx.strokeStyle = "rgba(255,255,255,0.06)";
+      ctx.beginPath();
+      ctx.moveTo(x0, y0 + ih);
+      ctx.lineTo(x0 + iw, y0 + ih);
+      ctx.stroke();
 
-    for (let ch = 0; ch < CHANNELS; ch++) {
-      const row = Math.floor(ch / COLS);
-      const col = ch % COLS;
-      const x0 = pad + col * cellW;
-      const y0 = pad + row * cellH;
-      const ih = cellH - 4;
-      const iw = cellW - 4;
-
-      // Cell border
-      ctx.strokeStyle = "rgba(255,255,255,0.08)";
-      ctx.strokeRect(x0 + 0.5, y0 + 0.5, iw + 3, ih + 3);
-
-      // Trace
+      // Trace downsampled per pixel
+      const vals = bufRef.current[ch];
+      if (!vals || vals.length === 0) continue;
       ctx.beginPath();
       let first = true;
-      const vals = bufRef.current[ch];
-      for (let i = 0; i < xs; i++) {
-        const x = x0 + 2 + (iw - 1) * ((tRef.current[i] - t0) / span);
-        const v = vals[i] || 0;
-        const y = y0 + 2 + (ih - 1) * (1 - v / 255);
+      for (let px = 0; px < iw; px++) {
+        const tt = t0 + (span * px) / Math.max(1, iw - 1);
+        let idx = Math.floor(((tt - t0) / span) * (xs - 1));
+        if (idx < 0) idx = 0; if (idx >= xs) idx = xs - 1;
+        const v = vals[idx] || 0;
+        const y = y0 + (ih - 1) * (1 - v / 255);
+        const x = x0 + px;
         if (first) { ctx.moveTo(x, y); first = false; } else { ctx.lineTo(x, y); }
       }
       ctx.strokeStyle = "#5ab0ff";
@@ -148,34 +161,72 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const chooseOpen = useCallback(async () => {
     const dialog = (window as any).__TAURI__?.dialog;
     const p = await dialog?.open({ multiple: false, filters: [{ name: "ArtNet JSONL", extensions: ["jsonl", "json"] }] });
-    if (p) setPath(String(p));
-  }, []);
-  const chooseSaveAndRecord = useCallback(async () => {
-    const dialog = (window as any).__TAURI__?.dialog;
-    const p = await dialog?.save({ defaultPath: "recording.jsonl", filters: [{ name: "JSON Lines", extensions: ["jsonl"] }] });
-    if (p) {
-      // reset buffers
+    if (!p) return;
+    const newPath = String(p);
+    if (tRef.current.length > 0 && !window.confirm("Discard current unsaved recording and load file?")) return;
+    const content = (await invoke("read_text_file", { path: newPath })) as string;
+    tRef.current = [];
+    bufRef.current = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
+    const lines = content.split(/\r?\n/).filter(Boolean);
+    let i = 0;
+    if (lines[0] && lines[0].includes("format") && lines[0].includes("artnet-jsonl")) i = 1;
+    for (; i < lines.length; i++) {
+      const obj = JSON.parse(lines[i]);
+      const t_ms = obj.t_ms as number;
+      const values = obj.values as number[];
+      tRef.current.push(t_ms);
+      for (let ch = 0; ch < CHANNELS; ch++) {
+        const prev = bufRef.current[ch];
+        const next = new Uint8Array(prev.length + 1);
+        if (prev.length) next.set(prev, 0);
+        next[prev.length] = values[ch] | 0;
+        bufRef.current[ch] = next;
+      }
+    }
+    setPath(newPath);
+    requestAnimationFrame(draw);
+  }, [draw]);
+
+  const toggleRecord = useCallback(() => {
+    if (!isRecording) {
       tRef.current = [];
       bufRef.current = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
-      setPath(String(p));
-      await invoke("start_recording", { path: String(p) });
       setIsRecording(true);
+    } else {
+      setIsRecording(false);
     }
+  }, [isRecording]);
+
+  const saveToFile = useCallback(async () => {
+    if (tRef.current.length === 0) return;
+    const dialog = (window as any).__TAURI__?.dialog;
+    const p = await dialog?.save({ defaultPath: "recording.jsonl", filters: [{ name: "JSON Lines", extensions: ["jsonl"] }] });
+    if (!p) return;
+    const t0 = tRef.current[0];
+    const lines: string[] = [];
+    lines.push(JSON.stringify({ format: "artnet-jsonl", version: 1 }));
+    for (let i = 0; i < tRef.current.length; i++) {
+      const t_ms = tRef.current[i] - t0;
+      const values = new Array(CHANNELS);
+      for (let ch = 0; ch < CHANNELS; ch++) values[ch] = bufRef.current[ch][i] | 0;
+      lines.push(JSON.stringify({ t_ms, net: 0, subnet: 0, universe: 0, length: CHANNELS, values }));
+    }
+    const content = lines.join("\n") + "\n";
+    await invoke("write_text_file", { path: String(p), content });
+    setPath(String(p));
   }, []);
-  const stopRec = useCallback(async () => {
-    await invoke("stop_recording");
-    setIsRecording(false);
-  }, []);
-  const play = useCallback(async () => {
-    if (!path) return;
-    setIsPlaying(true);
-    await invoke("play_file", { path });
-    setIsPlaying(false);
-  }, [path]);
-  const stopPlay = useCallback(async () => {
-    await invoke("stop_playback");
-    setIsPlaying(false);
-  }, []);
+
+  const togglePlay = useCallback(async () => {
+    if (!isPlaying) {
+      if (!path) { alert("Please load or save a recording to play."); return; }
+      setIsPlaying(true);
+      await invoke("play_file", { path });
+      setIsPlaying(false);
+    } else {
+      await invoke("stop_playback");
+      setIsPlaying(false);
+    }
+  }, [isPlaying, path]);
 
   return (
     <section className="view active">
@@ -191,19 +242,23 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
               <option key={u} value={u}>{u}</option>
             ))}
           </select>
-          <button className="btn" onClick={chooseSaveAndRecord} disabled={isRecording}>Record…</button>
-          <button className="btn danger" onClick={stopRec} disabled={!isRecording}>Stop</button>
+          <button className="btn" onClick={toggleRecord}>{isRecording ? "Stop" : "Record"}</button>
+          <button className="btn" onClick={saveToFile} disabled={tRef.current.length === 0}>Save…</button>
           <button className="btn" onClick={chooseOpen}>Load…</button>
-          <button className="btn" onClick={play} disabled={!path || isPlaying}>Play</button>
-          <button className="btn danger" onClick={stopPlay} disabled={!isPlaying}>Stop Play</button>
+          <button className="btn" onClick={togglePlay}>{isPlaying ? "Stop" : "Play"}</button>
           <span className="status">{path}</span>
         </div>
         <div className="controls-right">
-          <button className="iconbtn" title="Player Settings">🎛️</button>
+          <button className="iconbtn" title="Player Settings" onClick={() => alert("Player settings coming soon")}>🎛️</button>
         </div>
       </div>
-      <div ref={containerRef} style={{ width: "100%", height: "calc(100vh - 220px)", minHeight: 300, borderRadius: 12, overflow: "hidden", border: "1px solid var(--glass-border)", background: "var(--glass-bg)", backdropFilter: "var(--blur)" as any }}>
-        <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+      <div
+        ref={containerRef}
+        onScroll={(e) => { scrollTopRef.current = (e.target as HTMLDivElement).scrollTop; requestAnimationFrame(draw); }}
+        style={{ width: "100%", height: "calc(100vh - 220px)", minHeight: 300, borderRadius: 12, overflow: "auto", position: "relative", border: "1px solid var(--glass-border)", background: "var(--glass-bg)", backdropFilter: "var(--blur)" as any }}
+      >
+        <div style={{ height: CHANNELS * 14 + 16 }} />
+        <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block", pointerEvents: "none" }} />
       </div>
     </section>
   );

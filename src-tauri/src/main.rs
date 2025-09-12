@@ -180,6 +180,25 @@ fn stop_playback(state: tauri::State<AppState>) {
     state.stop_playback();
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EventFilter { net: u8, subnet: u8, universe: u8 }
+
+#[tauri::command]
+fn set_event_filter(state: tauri::State<AppState>, filter: Option<EventFilter>) {
+    let m = filter.map(|f| (f.net, f.subnet, f.universe));
+    state.set_event_filter(m);
+}
+
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -220,7 +239,10 @@ fn main() {
             start_recording,
             stop_recording,
             play_file,
-            stop_playback
+            stop_playback,
+            set_event_filter,
+            write_text_file,
+            read_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

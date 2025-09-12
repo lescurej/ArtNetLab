@@ -122,3 +122,8 @@ cargo tauri build
 - **Firewall**: Ensure UDP port 6454 is open for your network interface
 
 ## File Structure
+
+## Releases CI
+
+- Tagged commits `v*` trigger a multi-OS Tauri build and create a GitHub Release with DMG (macOS), Windows, and Linux installers.
+- Configure required secrets before tagging. See `docs/release-ci.md`.

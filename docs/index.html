@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ArtNetLab</title>
+    <link rel="icon" href="favicon.png">
+    <style>
+        :root {
+            --background-primary: #121212;
+            --background-secondary: #1E1E1E;
+            --text-primary: #FFFFFF;
+            --text-secondary: #B3B3B3;
+            --accent-color: #007AFF;
+            --accent-hover: #0056b3;
+        }
+
+        body {
+            background-color: var(--background-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 1em;
+            color: var(--text-primary);
+        }
+
+        h2 {
+            font-size: 1.8em;
+            margin: 1.5em 0 0.8em;
+            color: var(--text-primary);
+            border-bottom: 1px solid var(--text-secondary);
+            padding-bottom: 0.3em;
+        }
+
+        p {
+            margin: 1em 0;
+            color: var(--text-secondary);
+        }
+
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+
+        li {
+            margin: 0.8em 0;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+        }
+
+        li::before {
+            content: "•";
+            color: var(--accent-color);
+            font-weight: bold;
+            margin-right: 0.5em;
+        }
+
+        a {
+            color: var(--accent-color);
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+
+        a:hover {
+            color: var(--accent-hover);
+        }
+
+        .download-button {
+            display: inline-block;
+            background-color: var(--accent-color);
+            color: white;
+            padding: 12px 24px;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 500;
+            margin: 1em 0;
+            transition: background-color 0.2s ease;
+        }
+
+        .download-button:hover {
+            background-color: var(--accent-hover);
+            color: white;
+        }
+
+        .screenshot {
+            width: 100%;
+            max-width: 800px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            margin: 2em 0;
+        }
+
+        .emoji {
+            margin-right: 0.5em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ArtNetLab</h1>
+        
+        <p>ArtNetLab is a modern desktop application for professional DMX lighting control and monitoring. Built with React and TypeScript frontend and Rust backend, it provides comprehensive Art-Net tools for lighting professionals.</p>
+
+        <h2>Features</h2>
+        <ul>
+            <li><span class="emoji">🎛️</span> 512 individual DMX faders with dual input methods</li>
+            <li><span class="emoji">📊</span> Real-time Art-Net monitoring with interactive tooltips</li>
+            <li><span class="emoji">🎚️</span> Master control with real-time scaling</li>
+            <li><span class="emoji">🔄</span> Built-in animation engine (sinusoid, ramp, square)</li>
+            <li><span class="emoji">📹</span> Record and playback with frame-perfect timing</li>
+            <li><span class="emoji">🌐</span> Multi-universe support and network configuration</li>
+            <li><span class="emoji">🖥️</span> Cross-platform (macOS, Windows, Linux)</li>
+        </ul>
+
+        <h2>How it Works</h2>
+        <ol>
+            <li><strong>Monitor:</strong> Start monitoring to view incoming Art-Net data in real-time with interactive tooltips.</li>
+            <li><strong>Control:</strong> Use 512 individual faders or master control to send DMX data via Art-Net.</li>
+            <li><strong>Animate:</strong> Create automated patterns with built-in animation modes and frequency control.</li>
+            <li><strong>Record:</strong> Capture incoming data to JSON Lines format for later playback.</li>
+        </ol>
+
+        <h2>Download</h2>
+        <a href="https://github.com/lescurej/ArtNetLab/releases/latest" class="download-button">Download Latest Version</a>
+
+        <h2>Requirements</h2>
+        <ul>
+            <li>macOS 10.15+, Windows 10+, or Linux</li>
+            <li>50MB of free disk space</li>
+            <li>Network access for Art-Net communication</li>
+        </ul>
+
+        <h2>Support</h2>
+        <ul>
+            <li><a href="https://github.com/lescurej/ArtNetLab/issues">Report Issues</a></li>
+            <li><a href="https://github.com/lescurej/ArtNetLab/wiki">Documentation</a></li>
+        </ul>
+
+        <h2>Interface Preview</h2>
+        <img src="interface.png" alt="ArtNetLab Interface" class="screenshot">
+    </div>
+</body>
+</html> 

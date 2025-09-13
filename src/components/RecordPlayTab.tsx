@@ -45,6 +45,28 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   );
   const [recordChannels, setRecordChannels] = useState<number[]>([1]);
   const [showChannelPicker, setShowChannelPicker] = useState(false);
+  const [rangeStart, setRangeStart] = useState(1);
+  const [rangeEnd, setRangeEnd] = useState(1);
+
+  const handleAddRange = useCallback(() => {
+    const s = Math.min(Math.max(1, rangeStart), CHANNELS);
+    const e = Math.min(Math.max(1, rangeEnd), CHANNELS);
+    const start = Math.min(s, e);
+    const end = Math.max(s, e);
+    setRecordChannels((prev) => {
+      const set = new Set(prev);
+      for (let ch = start; ch <= end; ch++) set.add(ch);
+      return Array.from(set).sort((a, b) => a - b);
+    });
+  }, [rangeStart, rangeEnd]);
+
+  const handleSelectAll = useCallback(() => {
+    setRecordChannels(Array.from({ length: CHANNELS }, (_, idx) => idx + 1));
+  }, []);
+
+  const handleClearChannels = useCallback(() => {
+    setRecordChannels([]);
+  }, []);
 
   // Data buffers: timestamps and per-channel arrays of values
   const tRef = useRef<number[]>([]);
@@ -805,6 +827,42 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         >
           <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
             <h3>Select Channels</h3>
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                flexWrap: "wrap",
+                marginBottom: 8,
+                alignItems: "center",
+              }}
+            >
+              <input
+                type="number"
+                min={1}
+                max={CHANNELS}
+                value={rangeStart}
+                onChange={(e) => setRangeStart(Number(e.currentTarget.value))}
+                style={{ width: 60 }}
+              />
+              <span>to</span>
+              <input
+                type="number"
+                min={1}
+                max={CHANNELS}
+                value={rangeEnd}
+                onChange={(e) => setRangeEnd(Number(e.currentTarget.value))}
+                style={{ width: 60 }}
+              />
+              <button className="btn" onClick={handleAddRange}>
+                Add Range
+              </button>
+              <button className="btn" onClick={handleSelectAll}>
+                Select All
+              </button>
+              <button className="btn" onClick={handleClearChannels}>
+                Clear
+              </button>
+            </div>
             <div
               style={{
                 display: "grid",

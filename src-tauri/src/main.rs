@@ -245,7 +245,7 @@ fn save_wav_recording(
     let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
 
     // WAV header
-    let num_channels = 512u16; // 512 DMX channels
+    let num_channels = data.channels.len() as u16;
     let bits_per_sample = 8u16;
     let bytes_per_sample = bits_per_sample / 8;
     let block_align = num_channels * bytes_per_sample;
@@ -284,7 +284,7 @@ fn save_wav_recording(
 
     // Write sample data (interleaved channels)
     for frame_idx in 0..data.timestamps.len() {
-        for ch in 0..512 {
+        for ch in 0..num_channels as usize {
             let value = if ch < data.channels.len() && frame_idx < data.channels[ch].len() {
                 data.channels[ch][frame_idx]
             } else {
@@ -339,6 +339,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
 
     // Find fmt chunk
     let mut sample_rate = 44100u32; // Default sample rate
+    let mut num_channels = 0u16;
     while pos < buffer.len() - 8 {
         let chunk_id = &buffer[pos..pos + 4];
         let chunk_size = u32::from_le_bytes([
@@ -355,7 +356,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             }
 
             let _format = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]);
-            let num_channels = u16::from_le_bytes([buffer[pos + 2], buffer[pos + 3]]);
+            num_channels = u16::from_le_bytes([buffer[pos + 2], buffer[pos + 3]]);
             sample_rate = u32::from_le_bytes([
                 buffer[pos + 4],
                 buffer[pos + 5],
@@ -371,9 +372,6 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             let _block_align = u16::from_le_bytes([buffer[pos + 12], buffer[pos + 13]]);
             let bits_per_sample = u16::from_le_bytes([buffer[pos + 14], buffer[pos + 15]]);
 
-            if num_channels != 512 {
-                return Err(format!("Expected 512 channels, got {}", num_channels));
-            }
             if bits_per_sample != 8 {
                 return Err(format!(
                     "Expected 8 bits per sample, got {}",
@@ -405,14 +403,14 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
 
         if chunk_id == b"data" {
             // Read sample data
-            let num_frames = chunk_size as usize / 512; // 512 channels per frame
+            let num_frames = chunk_size as usize / num_channels as usize;
             let mut timestamps = Vec::new();
-            let mut channels = vec![Vec::new(); 512];
+            let mut channels = vec![Vec::new(); num_channels as usize];
 
             for frame_idx in 0..num_frames {
                 timestamps.push((frame_idx as u64 * 1000) / sample_rate as u64); // Convert to milliseconds
 
-                for ch in 0..512 {
+                for ch in 0..num_channels as usize {
                     if pos < buffer.len() {
                         channels[ch].push(buffer[pos]);
                         pos += 1;

@@ -330,16 +330,22 @@ pub async fn run_play_task(path: String, cfg: SenderConfig) -> Result<()> {
     let sock = artnet::sender_socket().await?;
     let file = std::fs::File::open(&path)?;
     let mut lines = BufReader::new(file).lines();
-    // skip header if present
     let mut first = true;
+    let mut channels: Vec<usize> = (1..=512).collect();
     let mut last_t: Option<u64> = None;
     while let Some(line) = lines.next() {
         let line = line?;
         if first {
             first = false;
-            // If header, continue; else try to parse as frame
+            // If header, parse channels mapping and continue
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                 if val.get("format").is_some() {
+                    if let Some(arr) = val.get("channels").and_then(|v| v.as_array()) {
+                        channels = arr
+                            .iter()
+                            .filter_map(|n| n.as_u64().map(|x| x as usize))
+                            .collect();
+                    }
                     continue;
                 }
             }
@@ -367,8 +373,11 @@ pub async fn run_play_task(path: String, cfg: SenderConfig) -> Result<()> {
         send_cfg.subnet = rec.subnet;
         send_cfg.universe = rec.universe;
         let mut arr = [0u8; 512];
-        let len = rec.length.min(512);
-        arr[..len as usize].copy_from_slice(&rec.values[..len as usize]);
+        for (idx, ch) in channels.iter().enumerate() {
+            if idx < rec.values.len() && *ch >= 1 && *ch <= 512 {
+                arr[*ch - 1] = rec.values[idx];
+            }
+        }
         let _ = crate::artnet::send_artdmx(&sock, &send_cfg, &arr, 0).await;
     }
     Ok(())

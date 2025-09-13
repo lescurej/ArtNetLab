@@ -43,6 +43,8 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const [recordingFormat, setRecordingFormat] = useState<"jsonl" | "wav">(
     "jsonl"
   );
+  const [recordChannels, setRecordChannels] = useState<number[]>([1]);
+  const [showChannelPicker, setShowChannelPicker] = useState(false);
 
   // Data buffers: timestamps and per-channel arrays of values
   const tRef = useRef<number[]>([]);
@@ -187,14 +189,15 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
 
         // Always save complete data
         tRef.current.push(now);
-        for (let ch = 0; ch < CHANNELS; ch++) {
-          const v = values[ch] | 0;
-          const prev = bufRef.current[ch];
+        recordChannels.forEach((ch) => {
+          const chIdx = Math.min(Math.max(ch - 1, 0), CHANNELS - 1);
+          const v = values[chIdx] | 0;
+          const prev = bufRef.current[chIdx];
           const next = new Uint8Array(prev.length + 1);
           if (prev.length) next.set(prev, 0);
           next[prev.length] = v;
-          bufRef.current[ch] = next;
-        }
+          bufRef.current[chIdx] = next;
+        });
 
         // Downsample for visualization
         const shouldSample =
@@ -237,7 +240,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     return () => {
       unlisten?.then((fn) => fn());
     };
-  }, [isRecording, selected, draw]);
+  }, [isRecording, selected, draw, recordChannels]);
 
   // TTL prune universes and control blink state for selected
   useEffect(() => {
@@ -342,6 +345,8 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       for (let ch = 0; ch < CHANNELS; ch++) {
         bufRef.current[ch] = new Uint8Array(wavData.channels[ch] || []);
       }
+      const wavChannels = wavData.channels.map((_: any, idx: number) => idx + 1);
+      setRecordChannels(wavChannels);
     } else {
       // Load JSONL file
       const content = (await invoke("read_text_file", {
@@ -360,13 +365,22 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         () => new Uint8Array(0)
       );
       const lines = content.split(/\r?\n/).filter(Boolean);
+      let channels = Array.from({ length: CHANNELS }, (_, idx) => idx + 1);
       let i = 0;
       if (
         lines[0] &&
         lines[0].includes("format") &&
         lines[0].includes("artnet-jsonl")
-      )
+      ) {
+        const header = JSON.parse(lines[0]);
+        if (Array.isArray(header.channels)) {
+          channels = header.channels.map((n: number) => Number(n) | 0);
+        } else if (typeof header.channel === "number") {
+          channels = [Number(header.channel) | 0];
+        }
         i = 1;
+        setRecordChannels(channels);
+      }
       for (; i < lines.length; i++) {
         const obj = JSON.parse(lines[i]);
         const t_ms = obj.t_ms as number;
@@ -375,13 +389,14 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           loadedKey = `${obj.net | 0}/${obj.subnet | 0}/${obj.universe | 0}`;
         }
         tRef.current.push(t_ms);
-        for (let ch = 0; ch < CHANNELS; ch++) {
+        channels.forEach((chNum, idx) => {
+          const ch = Math.min(Math.max(chNum - 1, 0), CHANNELS - 1);
           const prev = bufRef.current[ch];
           const next = new Uint8Array(prev.length + 1);
           if (prev.length) next.set(prev, 0);
-          next[prev.length] = values[ch] | 0;
+          next[prev.length] = values[idx] | 0;
           bufRef.current[ch] = next;
-        }
+        });
       }
     }
 
@@ -464,8 +479,10 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         sampleRate,
         data: {
           timestamps: tRef.current.map((t) => t - t0),
-          channels: Array.from({ length: CHANNELS }, (_, ch) =>
-            Array.from(bufRef.current[ch])
+          channels: recordChannels.map((ch) =>
+            Array.from(
+              bufRef.current[Math.min(Math.max(ch - 1, 0), CHANNELS - 1)]
+            )
           ),
         },
       });
@@ -473,12 +490,19 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       // Save as JSONL format
       const t0 = tRef.current[0];
       const lines: string[] = [];
-      lines.push(JSON.stringify({ format: "artnet-jsonl", version: 1 }));
+      lines.push(
+        JSON.stringify({
+          format: "artnet-jsonl",
+          version: 1,
+          channels: recordChannels,
+        })
+      );
       for (let i = 0; i < tRef.current.length; i++) {
         const t_ms = tRef.current[i] - t0;
-        const values = new Array(CHANNELS);
-        for (let ch = 0; ch < CHANNELS; ch++)
-          values[ch] = bufRef.current[ch][i] | 0;
+        const vals = recordChannels.map((ch) => {
+          const chIdx = Math.min(Math.max(ch - 1, 0), CHANNELS - 1);
+          return bufRef.current[chIdx][i] | 0;
+        });
         // Include addressing of the selected universe if available
         let net = 0,
           subnet = 0,
@@ -495,8 +519,8 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
             net,
             subnet,
             universe,
-            length: CHANNELS,
-            values,
+            length: recordChannels.length,
+            values: vals,
           })
         );
       }
@@ -505,7 +529,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     }
 
     setPath(String(p));
-  }, [selected, recordingFormat]);
+  }, [selected, recordingFormat, recordChannels]);
 
   const togglePlay = useCallback(async () => {
     if (!isPlaying) {
@@ -609,6 +633,17 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
             <option value="jsonl">JSONL (Text)</option>
             <option value="wav">WAV (Binary)</option>
           </select>
+          <label className="animation-label">Channels:</label>
+          <button
+            className="btn"
+            onClick={() => setShowChannelPicker(true)}
+            type="button"
+          >
+            Select
+          </button>
+          <span style={{ marginLeft: 8 }}>
+            {recordChannels.length > 0 ? recordChannels.join(",") : "None"}
+          </span>
           <span
             title={blink ? "DMX activity" : "No recent frames"}
             style={{
@@ -763,6 +798,58 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           })()}
         </div>
       </div>
+      {showChannelPicker && (
+        <div
+          className={`modal-backdrop ${showChannelPicker ? "show" : ""}`}
+          onMouseDown={() => setShowChannelPicker(false)}
+        >
+          <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
+            <h3>Select Channels</h3>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(8, 1fr)",
+                maxHeight: "50vh",
+                overflowY: "auto",
+                gap: 4,
+              }}
+            >
+              {Array.from({ length: CHANNELS }, (_, idx) => {
+                const ch = idx + 1;
+                const checked = recordChannels.includes(ch);
+                return (
+                  <label
+                    key={ch}
+                    style={{ display: "flex", alignItems: "center", gap: 4 }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() =>
+                        setRecordChannels((prev) => {
+                          const next = checked
+                            ? prev.filter((c) => c !== ch)
+                            : [...prev, ch];
+                          return next.sort((a, b) => a - b);
+                        })
+                      }
+                    />
+                    {ch}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="actions">
+              <button
+                className="btn"
+                onClick={() => setShowChannelPicker(false)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {showSettings && settings && (
         <div
           className={`modal-backdrop ${showSettings ? "show" : ""}`}

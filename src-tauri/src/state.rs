@@ -8,7 +8,10 @@ use tokio::{
 };
 
 use crate::artnet::{self, ReceiverConfig, SenderConfig};
+use serde::Serialize;
 use tauri::Emitter;
+
+const MAX_RECORD_FRAMES: usize = 200_000;
 
 // Animation state
 #[derive(Clone)]
@@ -31,6 +34,216 @@ impl Default for AnimationState {
 }
 
 #[derive(Clone)]
+pub struct RecordData {
+    pub timestamps: Vec<u64>,
+    pub addresses: Vec<(u8, u8, u8)>,
+    pub channels: Vec<usize>,
+    pub values: Vec<Vec<u8>>,
+}
+
+impl RecordData {
+    pub fn frame_count(&self) -> usize {
+        self.timestamps.len()
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.timestamps.last().copied().unwrap_or(0)
+    }
+
+    pub fn channel_numbers(&self) -> Vec<u16> {
+        self.channels.iter().map(|c| (*c + 1) as u16).collect()
+    }
+
+    pub fn last_address(&self) -> Option<(u8, u8, u8)> {
+        self.addresses.last().copied()
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct PreviewPoint {
+    pub t_ms: u64,
+    pub value: u8,
+}
+
+#[derive(Clone, Serialize)]
+pub struct PreviewResponse {
+    pub points: Vec<PreviewPoint>,
+    pub frame_count: usize,
+    pub duration_ms: u64,
+}
+
+struct RecordBuffer {
+    channels: Vec<usize>,
+    timestamps: Vec<u64>,
+    values: Vec<Vec<u8>>,
+    addresses: Vec<(u8, u8, u8)>,
+    start: Instant,
+    active: bool,
+}
+
+impl RecordBuffer {
+    fn new(channels: Vec<usize>, active: bool) -> Self {
+        let values = channels.iter().map(|_| Vec::new()).collect();
+        Self {
+            channels,
+            timestamps: Vec::new(),
+            values,
+            addresses: Vec::new(),
+            start: Instant::now(),
+            active,
+        }
+    }
+
+    fn from_data(data: RecordData, active: bool) -> Self {
+        Self {
+            channels: data.channels,
+            timestamps: data.timestamps,
+            values: data.values,
+            addresses: data.addresses,
+            start: Instant::now(),
+            active,
+        }
+    }
+
+    fn set_channels(&mut self, channels: Vec<usize>) {
+        let frame_count = self.timestamps.len();
+        let mut new_values = Vec::with_capacity(channels.len());
+        for ch in &channels {
+            if let Some(idx) = self.channels.iter().position(|c| c == ch) {
+                new_values.push(self.values[idx].clone());
+            } else {
+                new_values.push(vec![0u8; frame_count]);
+            }
+        }
+        self.channels = channels;
+        self.values = new_values;
+    }
+
+    fn append(&mut self, frame: &artnet::DmxFrame) {
+        if !self.active {
+            return;
+        }
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        self.timestamps.push(elapsed);
+        self.addresses
+            .push((frame.net, frame.subnet, frame.universe));
+        for (idx, ch) in self.channels.iter().enumerate() {
+            let value = if *ch < frame.values.len() {
+                frame.values[*ch]
+            } else {
+                0
+            };
+            if let Some(vec) = self.values.get_mut(idx) {
+                vec.push(value);
+            }
+        }
+        self.enforce_limit();
+    }
+
+    fn preview(&self, channel: usize, max_points: usize) -> Option<PreviewResponse> {
+        let idx = self.channels.iter().position(|c| *c == channel)?;
+        let values = self.values.get(idx)?;
+        let total = values.len();
+        let duration = self.duration_ms();
+        if total == 0 || max_points == 0 {
+            return Some(PreviewResponse {
+                points: Vec::new(),
+                frame_count: total,
+                duration_ms: duration,
+            });
+        }
+
+        let mut points = Vec::new();
+        if total <= max_points {
+            points.reserve(total);
+            for (i, value) in values.iter().enumerate() {
+                if let Some(&t) = self.timestamps.get(i) {
+                    points.push(PreviewPoint {
+                        t_ms: t,
+                        value: *value,
+                    });
+                }
+            }
+        } else {
+            let step = ((total as f64) / (max_points as f64)).ceil() as usize;
+            let mut i = 0;
+            while i < total {
+                if let Some(&t) = self.timestamps.get(i) {
+                    points.push(PreviewPoint {
+                        t_ms: t,
+                        value: values[i],
+                    });
+                }
+                i += step.max(1);
+            }
+            if points.last().map(|p| p.t_ms) != self.timestamps.last().copied() {
+                if let Some(last_idx) = total.checked_sub(1) {
+                    if let Some(&t) = self.timestamps.get(last_idx) {
+                        points.push(PreviewPoint {
+                            t_ms: t,
+                            value: values[last_idx],
+                        });
+                    }
+                }
+            }
+        }
+
+        Some(PreviewResponse {
+            points,
+            frame_count: total,
+            duration_ms: duration,
+        })
+    }
+
+    fn to_record_data(&self) -> RecordData {
+        RecordData {
+            timestamps: self.timestamps.clone(),
+            addresses: self.addresses.clone(),
+            channels: self.channels.clone(),
+            values: self.values.clone(),
+        }
+    }
+
+    fn frame_count(&self) -> usize {
+        self.timestamps.len()
+    }
+
+    fn duration_ms(&self) -> u64 {
+        self.timestamps.last().copied().unwrap_or(0)
+    }
+
+    fn last_address(&self) -> Option<(u8, u8, u8)> {
+        self.addresses.last().copied()
+    }
+
+    fn enforce_limit(&mut self) {
+        if self.timestamps.len() <= MAX_RECORD_FRAMES {
+            return;
+        }
+        let drop = self.timestamps.len() - MAX_RECORD_FRAMES;
+        self.timestamps.drain(0..drop);
+        self.addresses.drain(0..drop);
+        for values in self.values.iter_mut() {
+            if values.len() > drop {
+                values.drain(0..drop);
+            } else {
+                values.clear();
+            }
+        }
+    }
+}
+
+fn normalize_channels(channels: Vec<usize>) -> Vec<usize> {
+    let mut result = Vec::new();
+    for ch in channels {
+        if ch < 512 && !result.contains(&ch) {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+#[derive(Clone)]
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
 }
@@ -47,6 +260,7 @@ struct Inner {
     // Recording
     record_tx: Option<mpsc::UnboundedSender<crate::artnet::DmxFrame>>,
     record_task: Option<JoinHandle<()>>,
+    record_buffer: Option<RecordBuffer>,
     // Playback
     play_task: Option<JoinHandle<()>>,
     // Animation
@@ -68,6 +282,7 @@ impl Default for AppState {
                 sequence: 0,
                 record_tx: None,
                 record_task: None,
+                record_buffer: None,
                 play_task: None,
                 animation_state: AnimationState::default(),
                 animation_task: None,
@@ -108,6 +323,89 @@ impl AppState {
     }
     pub fn set_channels(&self, values: &[u8]) {
         self.inner.lock().unwrap().channels.copy_from_slice(values);
+    }
+
+    pub fn start_buffered_recording(&self, channels: Vec<usize>) -> Vec<usize> {
+        let normalized = normalize_channels(channels);
+        let mut guard = self.inner.lock().unwrap();
+        guard.record_buffer = Some(RecordBuffer::new(normalized.clone(), true));
+        normalized
+    }
+
+    pub fn stop_buffered_recording(&self) {
+        if let Some(buffer) = self.inner.lock().unwrap().record_buffer.as_mut() {
+            buffer.active = false;
+        }
+    }
+
+    pub fn clear_record_buffer(&self) {
+        self.inner.lock().unwrap().record_buffer = None;
+    }
+
+    pub fn set_record_channels(&self, channels: Vec<usize>) -> Vec<usize> {
+        let normalized = normalize_channels(channels);
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(buffer) = guard.record_buffer.as_mut() {
+            buffer.set_channels(normalized.clone());
+        } else {
+            guard.record_buffer = Some(RecordBuffer::new(normalized.clone(), false));
+        }
+        normalized
+    }
+
+    pub fn append_record_frame(&self, frame: &artnet::DmxFrame) {
+        if let Some(buffer) = self.inner.lock().unwrap().record_buffer.as_mut() {
+            buffer.append(frame);
+        }
+    }
+
+    pub fn record_preview(&self, channel: usize, max_points: usize) -> Option<PreviewResponse> {
+        self.inner
+            .lock()
+            .unwrap()
+            .record_buffer
+            .as_ref()
+            .and_then(|buffer| buffer.preview(channel, max_points))
+    }
+
+    pub fn record_data_snapshot(&self) -> Option<RecordData> {
+        self.inner
+            .lock()
+            .unwrap()
+            .record_buffer
+            .as_ref()
+            .map(|buffer| buffer.to_record_data())
+    }
+
+    pub fn load_record_data(&self, data: RecordData, active: bool) {
+        self.inner.lock().unwrap().record_buffer = Some(RecordBuffer::from_data(data, active));
+    }
+
+    pub fn record_channels(&self) -> Vec<usize> {
+        self.inner
+            .lock()
+            .unwrap()
+            .record_buffer
+            .as_ref()
+            .map(|buffer| buffer.channels.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn record_summary(&self) -> (usize, u64) {
+        if let Some(buffer) = self.inner.lock().unwrap().record_buffer.as_ref() {
+            (buffer.frame_count(), buffer.duration_ms())
+        } else {
+            (0, 0)
+        }
+    }
+
+    pub fn record_last_address(&self) -> Option<(u8, u8, u8)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .record_buffer
+            .as_ref()
+            .and_then(|buffer| buffer.last_address())
     }
 
     pub fn next_sequence(&self) -> u8 {
@@ -269,6 +567,7 @@ pub async fn run_receiver_task(
             };
             if pass {
                 let _ = window.emit("artnet:dmx_filtered", &frame);
+                app_state.append_record_frame(&frame);
             }
             // Forward to recorder if active
             if let Some(tx) = app_state.inner.lock().unwrap().record_tx.clone() {

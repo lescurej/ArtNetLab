@@ -7,7 +7,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use state::AppState;
+use state::{AppState, PreviewResponse, RecordData};
 use tauri::Manager;
 use tokio::sync::mpsc;
 
@@ -15,6 +15,16 @@ use tokio::sync::mpsc;
 struct SettingsFile {
     receiver: artnet::ReceiverConfig,
     sender: artnet::SenderConfig,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadedRecording {
+    path: String,
+    channels: Vec<u16>,
+    frames: usize,
+    duration_ms: u64,
+    last_address: Option<(u8, u8, u8)>,
+    format: String,
 }
 
 fn settings_path(app: &tauri::AppHandle) -> PathBuf {
@@ -25,6 +35,160 @@ fn settings_path(app: &tauri::AppHandle) -> PathBuf {
     fs::create_dir_all(&dir).ok();
     dir.push("settings.json");
     dir
+}
+
+fn write_buffer_as_jsonl(path: &str, data: &RecordData) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let header = serde_json::json!({
+        "format": "artnet-jsonl",
+        "version": 1,
+        "channels": data.channel_numbers(),
+    });
+    writeln!(file, "{}", header.to_string()).map_err(|e| e.to_string())?;
+
+    let base = data.timestamps.first().copied().unwrap_or(0);
+
+    for idx in 0..data.frame_count() {
+        let timestamp = data
+            .timestamps
+            .get(idx)
+            .copied()
+            .unwrap_or(base)
+            .saturating_sub(base);
+        let (net, subnet, universe) = data.addresses.get(idx).copied().unwrap_or((0, 0, 0));
+        let values: Vec<u8> = data
+            .values
+            .iter()
+            .map(|channel| channel.get(idx).copied().unwrap_or(0))
+            .collect();
+        let line = serde_json::json!({
+            "t_ms": timestamp,
+            "net": net,
+            "subnet": subnet,
+            "universe": universe,
+            "length": values.len(),
+            "values": values,
+        });
+        writeln!(file, "{}", line.to_string()).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+fn write_buffer_as_wav(path: &str, data: &RecordData) -> Result<(), String> {
+    let frames = data.frame_count();
+    if frames == 0 {
+        return Err("No recorded frames".to_string());
+    }
+    let duration = data.duration_ms().max(1);
+    let sample_rate = ((frames as u64 * 1000) / duration).max(1) as u32;
+    let base = data.timestamps.first().copied().unwrap_or(0);
+    let timestamps: Vec<u64> = data
+        .timestamps
+        .iter()
+        .map(|t| t.saturating_sub(base))
+        .collect();
+    let channels: Vec<Vec<u8>> = data.values.iter().map(|v| v.clone()).collect();
+    let wav = WavRecordingData {
+        timestamps,
+        channels,
+    };
+    save_wav_recording(path.to_string(), sample_rate, wav)
+}
+
+fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut timestamps = Vec::new();
+    let mut addresses = Vec::new();
+    let mut channels: Vec<usize> = (0..512).collect();
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    let mut first_line = true;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if first_line {
+            first_line = false;
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if val.get("format").is_some() {
+                    if let Some(arr) = val.get("channels").and_then(|v| v.as_array()) {
+                        channels = arr
+                            .iter()
+                            .filter_map(|n| n.as_u64())
+                            .map(|n| n.saturating_sub(1) as usize)
+                            .filter(|n| *n < 512)
+                            .collect();
+                    } else if let Some(ch) = val.get("channel").and_then(|v| v.as_u64()) {
+                        let idx = ch.saturating_sub(1) as usize;
+                        if idx < 512 {
+                            channels = vec![idx];
+                        }
+                    }
+                    values = channels.iter().map(|_| Vec::new()).collect();
+                    continue;
+                }
+            }
+        }
+
+        if values.is_empty() {
+            values = channels.iter().map(|_| Vec::new()).collect();
+        }
+
+        let rec: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| e.to_string())?;
+        let t_ms = rec
+            .get("t_ms")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "Missing t_ms field".to_string())?;
+        let net = rec.get("net").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let subnet = rec.get("subnet").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let universe = rec.get("universe").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let vals = rec
+            .get("values")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "Missing values field".to_string())?;
+        timestamps.push(t_ms);
+        addresses.push((net, subnet, universe));
+        if values.len() < channels.len() {
+            values.resize_with(channels.len(), Vec::new);
+        }
+        for (idx, _ch) in channels.iter().enumerate() {
+            let val = vals
+                .get(idx)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u8)
+                .unwrap_or(0);
+            values[idx].push(val);
+        }
+    }
+
+    let mut normalized = Vec::new();
+    for ch in channels {
+        if ch < 512 && !normalized.contains(&ch) {
+            normalized.push(ch);
+        }
+    }
+
+    Ok(RecordData {
+        timestamps,
+        addresses,
+        channels: normalized,
+        values,
+    })
+}
+
+fn record_data_from_wav(data: WavRecordingData) -> RecordData {
+    let channels = data.channels.len();
+    let timestamps_len = data.timestamps.len();
+    RecordData {
+        timestamps: data.timestamps,
+        addresses: vec![(0, 0, 0); timestamps_len],
+        channels: (0..channels).collect(),
+        values: data.channels,
+    }
 }
 
 #[tauri::command]
@@ -90,12 +254,13 @@ fn stop_sender(state: tauri::State<AppState>) {
 
 #[tauri::command]
 async fn push_frame(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    // Send an immediate ArtDMX frame with current channels
+    if !state.sender_stream_active() {
+        return Ok(());
+    }
     let cfg = state.get_sender_config();
-    let data = state.channels_snapshot();
-    let seq = state.next_sequence();
-    let sock = artnet::sender_socket().await.map_err(|e| e.to_string())?;
-    artnet::send_artdmx(&sock, &cfg, &data, seq)
+    let sock = state.udp_for_send().await.map_err(|e| e.to_string())?;
+    let (data, seq) = state.snapshot_channels_tick_seq();
+    artnet::send_artdmx(sock.as_ref(), &cfg, &data, seq)
         .await
         .map_err(|e| e.to_string())
 }
@@ -131,23 +296,14 @@ fn load_settings(
     state: tauri::State<AppState>,
 ) -> Result<SettingsFile, String> {
     let path = settings_path(&app);
-    println!("Loading settings from: {:?}", path);
     if let Ok(bytes) = fs::read(&path) {
-        println!("Read {} bytes from settings file", bytes.len());
         if let Ok(cfg) = serde_json::from_slice::<SettingsFile>(&bytes) {
-            println!("Successfully parsed settings: {:?}", cfg);
             state.set_receiver_config(cfg.receiver.clone());
             state.set_sender_config(cfg.sender.clone());
             return Ok(cfg);
-        } else {
-            println!("Failed to parse settings JSON");
         }
-    } else {
-        println!("Failed to read settings file");
     }
-    let def = SettingsFile::default();
-    println!("Returning default settings: {:?}", def);
-    Ok(def)
+    Ok(SettingsFile::default())
 }
 
 #[tauri::command]
@@ -167,6 +323,108 @@ fn start_recording(state: tauri::State<AppState>, path: String) -> Result<(), St
 #[tauri::command]
 fn stop_recording(state: tauri::State<AppState>) {
     state.stop_recording();
+}
+
+#[tauri::command]
+fn start_buffered_recording(
+    state: tauri::State<AppState>,
+    channels: Vec<u16>,
+) -> Result<Vec<u16>, String> {
+    let normalized = state.start_buffered_recording(
+        channels
+            .into_iter()
+            .map(|c| c.saturating_sub(1) as usize)
+            .collect(),
+    );
+    Ok(normalized.into_iter().map(|c| (c + 1) as u16).collect())
+}
+
+#[tauri::command]
+fn stop_buffered_recording(state: tauri::State<AppState>) {
+    state.stop_buffered_recording();
+}
+
+#[tauri::command]
+fn clear_record_buffer(state: tauri::State<AppState>) {
+    state.clear_record_buffer();
+}
+
+#[tauri::command]
+fn set_record_channels(
+    state: tauri::State<AppState>,
+    channels: Vec<u16>,
+) -> Result<Vec<u16>, String> {
+    let normalized = state.set_record_channels(
+        channels
+            .into_iter()
+            .map(|c| c.saturating_sub(1) as usize)
+            .collect(),
+    );
+    Ok(normalized.into_iter().map(|c| (c + 1) as u16).collect())
+}
+
+#[tauri::command]
+fn get_recording_preview(
+    state: tauri::State<AppState>,
+    channel: u16,
+    max_points: usize,
+) -> Result<PreviewResponse, String> {
+    if channel == 0 {
+        return Err("Channel must be greater than zero".into());
+    }
+    let preview = state
+        .record_preview(channel.saturating_sub(1) as usize, max_points)
+        .unwrap_or(PreviewResponse {
+            points: Vec::new(),
+            frame_count: 0,
+            duration_ms: 0,
+        });
+    Ok(preview)
+}
+
+#[tauri::command]
+fn save_buffered_recording_jsonl(
+    state: tauri::State<AppState>,
+    path: String,
+) -> Result<(), String> {
+    let data = state
+        .record_data_snapshot()
+        .ok_or_else(|| "No recording data available".to_string())?;
+    write_buffer_as_jsonl(&path, &data)
+}
+
+#[tauri::command]
+fn save_buffered_recording_wav(state: tauri::State<AppState>, path: String) -> Result<(), String> {
+    let data = state
+        .record_data_snapshot()
+        .ok_or_else(|| "No recording data available".to_string())?;
+    write_buffer_as_wav(&path, &data)
+}
+
+#[tauri::command]
+fn load_recording(state: tauri::State<AppState>, path: String) -> Result<LoadedRecording, String> {
+    let lower = path.to_lowercase();
+    let (data, format) = if lower.ends_with(".wav") {
+        let wav = load_wav_recording(path.clone())?;
+        (record_data_from_wav(wav), "wav".to_string())
+    } else {
+        (parse_jsonl_file(&path)?, "jsonl".to_string())
+    };
+
+    let frames = data.frame_count();
+    let duration = data.duration_ms();
+    let last_address = data.last_address();
+    let channels = data.channel_numbers();
+    state.load_record_data(data, false);
+
+    Ok(LoadedRecording {
+        path,
+        channels,
+        frames,
+        duration_ms: duration,
+        last_address,
+        format,
+    })
 }
 
 #[tauri::command]
@@ -453,32 +711,57 @@ async fn play_wav_file(state: tauri::State<'_, AppState>, path: String) -> Resul
 
 #[tauri::command]
 async fn start_animation(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     mode: String,
     frequency: f64,
     master_value: u8,
+    chaser_from: Option<u16>,
+    chaser_to: Option<u16>,
 ) -> Result<(), String> {
-    // Stop existing animation
     state.stop_animation();
-
-    // Update animation state - use existing methods
+    let fq = if frequency.is_finite() {
+        frequency.abs().max(1e-3)
+    } else {
+        1.0
+    };
+    let kind = state::anim_kind_from_cmd(&mode);
+    let (cf, ct) = state::sanitize_chaser_ends(chaser_from.unwrap_or(1), chaser_to.unwrap_or(512));
     state.set_animation_state(state::AnimationState {
-        mode,
-        frequency,
+        mode: kind,
+        frequency: fq,
         master_value,
         is_running: true,
+        chaser_from: cf,
+        chaser_to: ct,
     });
 
-    // Start new animation task
     let app_state = state.inner().clone();
+    let app_h = app.clone();
     let handle = tokio::spawn(async move {
-        if let Err(e) = state::run_animation_task(app_state).await {
+        if let Err(e) = state::run_animation_task(app_state, app_h).await {
             eprintln!("Animation task error: {e:?}");
         }
     });
 
     state.set_animation_task(handle);
     Ok(())
+}
+
+#[tauri::command]
+fn patch_animation_params(
+    state: tauri::State<AppState>,
+    frequency: f64,
+    master_value: u8,
+    chaser_from: Option<u16>,
+    chaser_to: Option<u16>,
+) {
+    let fq = if frequency.is_finite() {
+        frequency.abs().max(1e-3)
+    } else {
+        1.0
+    };
+    state.patch_animation_live(fq, master_value, chaser_from, chaser_to);
 }
 
 #[tauri::command]
@@ -525,11 +808,20 @@ fn main() {
             load_settings,
             start_recording,
             stop_recording,
+            start_buffered_recording,
+            stop_buffered_recording,
+            clear_record_buffer,
+            set_record_channels,
+            get_recording_preview,
+            save_buffered_recording_jsonl,
+            save_buffered_recording_wav,
+            load_recording,
             play_file,
             stop_playback,
             set_event_filter,
             write_text_file,
             read_text_file,
+            patch_animation_params,
             start_animation,
             stop_animation,
             save_wav_recording,

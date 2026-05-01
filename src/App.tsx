@@ -11,6 +11,10 @@ function App() {
   // path handled within RecordPlayTab now
   const [masterValue, setMasterValue] = useState(255);
   const [senderRunning, setSenderRunning] = useState(false);
+  const senderRunningRef = useRef(false);
+  useEffect(() => {
+    senderRunningRef.current = senderRunning;
+  }, [senderRunning]);
 
   // SETTINGS state
   const [showMon, setShowMon] = useState(false);
@@ -29,15 +33,8 @@ function App() {
   useEffect(() => {
     invoke("load_settings")
       .then((s: any) => {
-        console.log("Loaded settings:", s);
-        if (s?.receiver) {
-          console.log("Setting receiver config:", s.receiver);
-          setMonCfg(s.receiver);
-        }
-        if (s?.sender) {
-          console.log("Setting sender config:", s.sender);
-          setSndCfg(s.sender);
-        }
+        if (s?.receiver) setMonCfg(s.receiver);
+        if (s?.sender) setSndCfg(s.sender);
       })
       .catch((e) => {
         console.error("Failed to load settings:", e);
@@ -69,6 +66,7 @@ function App() {
     }
   };
   const sendNow = async () => {
+    if (!senderRunningRef.current) return;
     await invoke("push_frame");
   };
   const all = async (v: number) => {
@@ -84,7 +82,7 @@ function App() {
   };
 
   // Update single fader, batch backend update + send
-  const [sendTimer, setSendTimer] = useState<number | null>(null);
+  const sendDebounceRef = useRef<number | null>(null);
   const fadersRef = useRef<number[]>(faders);
   const masterRef = useRef<number>(masterValue);
   useEffect(() => {
@@ -94,28 +92,42 @@ function App() {
     masterRef.current = masterValue;
   }, [masterValue]);
 
-  const onFader = useCallback(
-    (i: number, v: number) => {
-      setFaders((prev) => {
-        if (prev[i] === v) return prev;
-        const n = prev.slice();
-        n[i] = v;
-        return n;
-      });
-      if (sendTimer) return Promise.resolve();
-      const id = window.setTimeout(() => {
-        setSendTimer(null);
-        const src = fadersRef.current;
-        const m = masterRef.current;
-        const scaled = src.map((val) => Math.round((val * m) / 255));
-        invoke("set_channels", { values: scaled }).catch(() => {});
+  const onFader = useCallback((i: number, v: number) => {
+    setFaders((prev) => {
+      if (prev[i] === v) return prev;
+      const n = prev.slice();
+      n[i] = v;
+      return n;
+    });
+    if (sendDebounceRef.current != null) {
+      window.clearTimeout(sendDebounceRef.current);
+    }
+    sendDebounceRef.current = window.setTimeout(() => {
+      sendDebounceRef.current = null;
+      const src = fadersRef.current;
+      const m = masterRef.current;
+      const scaled = src.map((val) => Math.round((val * m) / 255));
+      invoke("set_channels", { values: scaled }).catch(() => {});
+      if (senderRunningRef.current)
         invoke("push_frame").catch(() => {});
-      }, 30);
-      setSendTimer(id);
-      return Promise.resolve();
-    },
-    [sendTimer]
-  );
+    }, 30);
+    return Promise.resolve();
+  }, []);
+
+  const onMomentaryHold = useCallback((i: number, down: boolean) => {
+    if (sendDebounceRef.current != null) {
+      window.clearTimeout(sendDebounceRef.current);
+      sendDebounceRef.current = null;
+    }
+    const m = masterRef.current;
+    const base = fadersRef.current.slice();
+    base[i] = down ? 255 : 0;
+    fadersRef.current = base;
+    setFaders(base);
+    const scaled = base.map((val) => Math.round((val * m) / 255));
+    invoke("set_channels", { values: scaled }).catch(() => {});
+    if (senderRunningRef.current) invoke("push_frame").catch(() => {});
+  }, []);
 
   const onInputChange = (i: number, value: string) => {
     const numValue = Number(value);
@@ -135,6 +147,8 @@ function App() {
 
   // Record/Play
   // Record/Play controls now handled in RecordPlayTab
+
+  const contentScrollRef = useRef<HTMLElement | null>(null);
 
   return (
     <div className="app">
@@ -181,7 +195,7 @@ function App() {
         )}
       </header>
 
-      <main className="content">
+      <main ref={contentScrollRef} className="content">
         {/* Monitor */}
         <section className={`view ${tab === "monitor" ? "active" : ""}`}>
           <MonitorCanvas />
@@ -190,9 +204,12 @@ function App() {
         {/* Sender (keep mounted so animation continues when hidden) */}
         <section className={`view ${tab === "sender" ? "active" : ""}`}>
           <SenderTab
+            scrollParentRef={contentScrollRef}
+            isSenderViewportActive={tab === "sender"}
             faders={faders}
             setFaders={setFaders}
             onFader={onFader}
+            onMomentaryHold={onMomentaryHold}
             onInputChange={onInputChange}
             all={all}
             startSender={startSender}

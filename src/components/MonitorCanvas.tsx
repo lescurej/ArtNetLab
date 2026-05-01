@@ -311,6 +311,20 @@ export default function MonitorCanvas() {
 
   // Subscribe to Art-Net frames
   useEffect(() => {
+    let pendingFc = 0;
+    let fcRafId = 0;
+    const bumpFrameCount = () => {
+      pendingFc += 1;
+      if (!fcRafId) {
+        fcRafId = requestAnimationFrame(() => {
+          fcRafId = 0;
+          const n = pendingFc;
+          pendingFc = 0;
+          setFrameCount((prev) => prev + n);
+        });
+      }
+    };
+
     const un = listen<Frame>("artnet:dmx", (e) => {
       const p = e.payload;
       if (!p) return;
@@ -356,10 +370,10 @@ export default function MonitorCanvas() {
 
       // Update history for all channels
       updateHistory(vals, now);
-
-      setFrameCount((prev) => prev + 1);
+      bumpFrameCount();
     });
     return () => {
+      cancelAnimationFrame(fcRafId);
       un.then((fn) => fn());
     };
   }, [selected, updateChannels, updateHistory]);

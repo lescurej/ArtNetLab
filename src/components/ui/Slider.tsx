@@ -57,7 +57,7 @@ export default function Slider({
         const r = 1 - clamped / usable;
         return clamp(r, 0, 1);
       } else {
-        const usable = rect.width - thumbSize;
+        const usable = height - thumbSize;
         const xFromLeft = clientX - rect.left - thumbSize / 2;
         const clamped = clamp(xFromLeft, 0, usable);
         const r = clamped / usable;
@@ -144,6 +144,8 @@ export default function Slider({
 
   // Layout variables for CSS
   const styleVars: React.CSSProperties = {
+    // @ts-ignore CSS variable
+    "--osl-ratio": String(ratio),
     // @ts-ignore custom props used in CSS
     "--osl-width":
       orientation === "vertical"
@@ -163,11 +165,7 @@ export default function Slider({
   const thumbPosStyle: React.CSSProperties =
     orientation === "vertical"
       ? { top: `${(height - thumbSize) * (1 - ratio)}px` }
-      : {
-          left: `${
-            ((rootRef.current?.clientWidth || 0) - thumbSize) * ratio
-          }px`,
-        };
+      : { left: `${(height - thumbSize) * ratio}px` };
 
   return (
     <div

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent,
+} from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -15,11 +22,164 @@ type Frame = {
 
 type UniverseKey = string; // "net/subnet/universe"
 
+type WavRecording = {
+  timestamps: number[];
+  channels: number[][];
+  dmx_channels?: number[];
+};
+
 interface RecordPlayTabProps {}
 
 const CHANNELS = 512;
-const CELL_H = 24; // larger rows for readability
-const GUTTER_W = 48; // left gutter for channel number
+const CELL_H = 24;
+const GUTTER_W = 48;
+
+function interpolatedSample(
+  vt: readonly number[],
+  vals: Uint8Array,
+  t: number
+): number {
+  const n = vt.length;
+  if (n === 0 || vals.length === 0) return 0;
+  const last = n - 1;
+  if (t <= vt[0]) return vals[0];
+  if (t >= vt[last]) return vals[last];
+  let lo = 0;
+  let hi = last;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (vt[mid] <= t) lo = mid;
+    else hi = mid;
+  }
+  const t0 = vt[lo];
+  const t1 = vt[hi];
+  const v0 = vals[lo];
+  const v1 = vals[hi];
+  const u = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+  return v0 + (v1 - v0) * u;
+}
+
+const VIZ_PREVIEW_WINDOW_MS = 30_000;
+const VIZ_HOLD_LAST_MS = 500;
+
+function trimVizBeforeTime(
+  cutoffMs: number,
+  channels: readonly number[],
+  vizTRef: { current: number[] },
+  vizBufRef: { current: Uint8Array[] }
+): void {
+  const vt = vizTRef.current;
+  const n = vt.length;
+  if (n === 0) return;
+  let start = 0;
+  while (start < n && vt[start] < cutoffMs) start++;
+  const sliceStart = Math.max(0, start - 1);
+  if (sliceStart === 0) return;
+  vizTRef.current = vt.slice(sliceStart);
+  for (const dmx of channels) {
+    const chIdx = Math.min(Math.max(dmx - 1, 0), CHANNELS - 1);
+    const buf = vizBufRef.current[chIdx];
+    if (buf.length >= n) {
+      vizBufRef.current[chIdx] = buf.slice(sliceStart);
+    }
+  }
+}
+
+function parseDmxChannelList(text: string, maxCh: number): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  const tokens = text.split(/[\s,]+/).filter(Boolean);
+  const rangeRe = /^(\d+)\s*-\s*(\d+)$/;
+
+  const add = (raw: number) => {
+    const v = Math.floor(raw);
+    if (v >= 1 && v <= maxCh && !seen.has(v)) {
+      seen.add(v);
+      out.push(v);
+    }
+  };
+
+  for (const tok of tokens) {
+    const m = tok.trim().match(rangeRe);
+    if (m) {
+      const a = parseInt(m[1], 10);
+      const b = parseInt(m[2], 10);
+      if (isNaN(a) || isNaN(b)) continue;
+      let lo = Math.min(a, b);
+      let hi = Math.max(a, b);
+      lo = Math.max(1, lo);
+      hi = Math.min(maxCh, hi);
+      for (let i = lo; i <= hi; i++) add(i);
+    } else {
+      const n = parseInt(tok, 10);
+      if (!isNaN(n)) add(n);
+    }
+  }
+  return out;
+}
+
+function normalizeLoadedChannels(channels: number[]): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const raw of channels) {
+    const ch = Number(raw) | 0;
+    if (ch >= 1 && ch <= CHANNELS && !seen.has(ch)) {
+      seen.add(ch);
+      out.push(ch);
+    }
+  }
+  return out.length ? out : [1];
+}
+
+function formatDmxChannelList(channels: number[]): string {
+  const normalized = normalizeLoadedChannels(channels);
+  const parts: string[] = [];
+  let start = normalized[0];
+  let prev = normalized[0];
+
+  for (let i = 1; i <= normalized.length; i++) {
+    const next = normalized[i];
+    if (next === prev + 1) {
+      prev = next;
+      continue;
+    }
+    parts.push(start === prev ? String(start) : `${start}-${prev}`);
+    start = next;
+    prev = next;
+  }
+
+  return parts.join(", ");
+}
+
+function formatPlaybackTime(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+async function decodeWavRecording(path: string): Promise<WavRecording> {
+  const bytes = (await invoke("read_binary_file", { path })) as number[];
+  const AudioContextCtor =
+    window.AudioContext ||
+    (window as typeof window & { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext;
+  if (!AudioContextCtor) {
+    throw new Error("Audio decoding is not available in this WebView");
+  }
+  const audio = await new AudioContextCtor().decodeAudioData(
+    new Uint8Array(bytes).buffer
+  );
+  const timestamps = Array.from({ length: audio.length }, (_, idx) =>
+    Math.round((idx * 1000) / audio.sampleRate)
+  );
+  const channels = Array.from({ length: audio.numberOfChannels }, (_, ch) =>
+    Array.from(audio.getChannelData(ch), (value) =>
+      Math.round(((Math.max(-1, Math.min(1, value)) + 1) / 2) * 255)
+    )
+  );
+  return { timestamps, channels };
+}
 
 type SenderConfig = {
   target_ip: string;
@@ -40,11 +200,22 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const [blink, setBlink] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<SenderConfig | null>(null);
+  const [isLooping, setIsLooping] = useState(false);
   const [recordingFormat, setRecordingFormat] = useState<"jsonl" | "wav">(
     "jsonl"
   );
   const [recordChannels, setRecordChannels] = useState<number[]>([1]);
   const [channelsText, setChannelsText] = useState("1");
+
+  const waveformRows = useMemo(
+    () => recordChannels.filter((n) => n >= 1 && n <= CHANNELS),
+    [recordChannels]
+  );
+  const waveformRowsRef = useRef<number[]>([1]);
+
+  useEffect(() => {
+    waveformRowsRef.current = waveformRows;
+  }, [waveformRows]);
 
   // Data buffers: timestamps and per-channel arrays of values
   const tRef = useRef<number[]>([]);
@@ -58,14 +229,36 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     Array.from({ length: CHANNELS }, () => new Uint8Array(0))
   );
 
-  const MAX_VIZ_FRAMES = 2000; // Keep visualization smooth (45 seconds)
-  const SAMPLE_RATE = 10; // Sample every 10th frame for visualization
-  const MAX_COMPLETE_FRAMES = 200000; // Allow 1+ hours of complete data
+  const MAX_VIZ_FRAMES = 2000;
+  const SAMPLE_RATE = 1;
+  const MAX_COMPLETE_FRAMES = 200000;
 
-  // Canvas
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollTopRef = useRef(0);
+  const incomingSeqRef = useRef(0);
+  const drawRafRef = useRef<number | null>(null);
+  const frozenVizEndRef = useRef<number | null>(null);
+  const playbackStartRef = useRef<number | null>(null);
+  const playbackDurationRef = useRef(0);
+  const playbackOffsetRef = useRef(0);
+  const playbackActiveRef = useRef(false);
+  const playbackLoopRef = useRef(false);
+  const timelineDragActiveRef = useRef(false);
+  const timelineDragWasPlayingRef = useRef(false);
+
+  useEffect(() => {
+    playbackLoopRef.current = isLooping;
+  }, [isLooping]);
+
+  const resetVisualization = useCallback(() => {
+    incomingSeqRef.current = 0;
+    vizTRef.current = [];
+    vizBufRef.current = Array.from(
+      { length: CHANNELS },
+      () => new Uint8Array(0)
+    );
+  }, []);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -82,11 +275,15 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     const dpr = window.devicePixelRatio || 1;
     const CW = Math.floor(W * dpr);
     const CH = Math.floor(H * dpr);
+    const cssW = `${W}px`;
+    const cssH = `${H}px`;
 
     if (canvas.width !== CW || canvas.height !== CH) {
       canvas.width = CW;
       canvas.height = CH;
     }
+    if (canvas.style.width !== cssW) canvas.style.width = cssW;
+    if (canvas.style.height !== cssH) canvas.style.height = cssH;
 
     // scale for crisp rendering
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -95,67 +292,122 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     ctx.fillStyle = "rgba(10, 16, 24, 0.85)";
     ctx.fillRect(0, 0, W, H);
 
-    const pad = 8;
+    const pad = 0;
     const cellH = CELL_H;
-    const xs = tRef.current.length;
-    if (xs === 0) {
+    const rows = waveformRowsRef.current;
+    const rowCount = rows.length;
+
+    if (rowCount === 0) {
       ctx.fillStyle = "#9fb3c8";
       ctx.font = "12px Inter, system-ui, -apple-system";
       ctx.fillText(
-        "Waiting for data… (Record to capture to file)",
+        "Enter one or more channels above to preview traces here.",
         pad,
         pad + 14
       );
       return;
     }
 
-    // Mapping time to X
-    const t0 = tRef.current[0];
-    const tN = tRef.current[xs - 1];
-    const span = Math.max(1, tN - t0);
+    const vt = vizTRef.current;
+    if (vt.length === 0) {
+      ctx.fillStyle = "#9fb3c8";
+      ctx.font = "12px Inter, system-ui, -apple-system";
+      ctx.fillText(
+        "Waiting for incoming DMX on the selected universe...",
+        pad,
+        pad + 14
+      );
+      return;
+    }
 
-    // Virtualize vertically: draw only visible rows
+    const frozenVizEnd = frozenVizEndRef.current;
+    const windowEndMs = frozenVizEnd ?? Date.now();
+    const windowStartMs =
+      frozenVizEnd == null
+        ? windowEndMs - VIZ_PREVIEW_WINDOW_MS
+        : Math.max(vt[0], windowEndMs - VIZ_PREVIEW_WINDOW_MS);
+    const span = Math.max(1, windowEndMs - windowStartMs);
+
     const scrollTop = scrollTopRef.current;
     const startRow = Math.max(0, Math.floor(scrollTop / cellH));
-    const endRow = Math.min(CHANNELS - 1, Math.floor((scrollTop + H) / cellH));
+    const endRow = Math.min(rowCount - 1, Math.floor((scrollTop + H) / cellH));
 
     ctx.lineWidth = 1.2;
-    for (let ch = startRow; ch <= endRow; ch++) {
-      const y0 = ch * cellH - scrollTop; // Remove pad offset
+    for (let rowIdx = startRow; rowIdx <= endRow; rowIdx++) {
+      const y0 = rowIdx * cellH - scrollTop;
       const ih = cellH - 6;
-      const x0 = pad + GUTTER_W;
-      const iw = W - pad * 2 - GUTTER_W;
+      const x0 = GUTTER_W;
+      const iw = W - GUTTER_W;
+      const dmxNum = rows[rowIdx];
+      const chBuf = Math.min(Math.max(dmxNum - 1, 0), CHANNELS - 1);
 
-      // row background and separator
       ctx.fillStyle =
-        ch % 2 === 0 ? "rgba(255,255,255,0.02)" : "rgba(255,255,255,0.03)";
-      ctx.fillRect(pad, y0, W - pad * 2, ih + 6);
+        rowIdx % 2 === 0
+          ? "rgba(255,255,255,0.02)"
+          : "rgba(255,255,255,0.03)";
+      ctx.fillRect(0, y0, W, ih + 6);
       ctx.strokeStyle = "rgba(255,255,255,0.08)";
       ctx.beginPath();
-      ctx.moveTo(pad, y0 + ih + 5.5);
-      ctx.lineTo(W - pad, y0 + ih + 5.5);
+      ctx.moveTo(0, y0 + ih + 5.5);
+      ctx.lineTo(W, y0 + ih + 5.5);
       ctx.stroke();
 
-      // channel number in gutter
       ctx.fillStyle = "#9fb3c8";
       ctx.font = "12px Inter, system-ui, -apple-system";
       ctx.textAlign = "right";
       ctx.textBaseline = "middle";
-      ctx.fillText(String(ch + 1), pad + GUTTER_W - 8, y0 + (ih + 6) / 2);
+      ctx.fillText(String(dmxNum), GUTTER_W - 8, y0 + (ih + 6) / 2);
 
-      // Trace downsampled per pixel
-      const vals = vizBufRef.current[ch];
+      const vals = vizBufRef.current[chBuf];
       if (!vals || vals.length === 0) continue;
+      const plotW = Math.max(2, Math.floor(iw));
+      const valueCount = Math.min(vt.length, vals.length);
+      if (valueCount === 0) continue;
+      const lastValueTime = vt[valueCount - 1];
+      const startTime = Math.max(windowStartMs, vt[0]);
+      const endTime = Math.min(
+        windowEndMs,
+        lastValueTime + (frozenVizEnd == null ? VIZ_HOLD_LAST_MS : 0)
+      );
+      if (endTime < startTime) continue;
+      const sampleAt = (t: number) => {
+        if (valueCount >= vt.length) return interpolatedSample(vt, vals, t);
+        if (t <= vt[0]) return vals[0];
+        if (t >= vt[valueCount - 1]) return vals[valueCount - 1];
+        let lo = 0;
+        let hi = valueCount - 1;
+        while (hi - lo > 1) {
+          const mid = (lo + hi) >> 1;
+          if (vt[mid] <= t) lo = mid;
+          else hi = mid;
+        }
+        const t0 = vt[lo];
+        const t1 = vt[hi];
+        const v0 = vals[lo];
+        const v1 = vals[hi];
+        const u = t1 > t0 ? (t - t0) / (t1 - t0) : 0;
+        return v0 + (v1 - v0) * u;
+      };
+      const startPx = Math.max(
+        0,
+        Math.min(
+          plotW - 1,
+          Math.floor(((startTime - windowStartMs) / span) * (plotW - 1))
+        )
+      );
+      const endPx = Math.max(
+        startPx,
+        Math.min(
+          plotW - 1,
+          Math.ceil(((endTime - windowStartMs) / span) * (plotW - 1))
+        )
+      );
+      const stride = plotW > 900 ? 2 : 1;
       ctx.beginPath();
       let first = true;
-      for (let px = 0; px < iw; px++) {
-        const tt = vizTRef.current[0] + (span * px) / Math.max(1, iw - 1);
-        let idx = Math.floor(
-          ((tt - vizTRef.current[0]) / span) * (vizTRef.current.length - 1)
-        );
-        if (idx < 0) idx = 0;
-        if (idx >= vizTRef.current.length) idx = vizTRef.current.length - 1;
-        const v = vals[idx] || 0;
+      for (let px = startPx; px <= endPx; px += stride) {
+        const tt = windowStartMs + (span * px) / Math.max(1, plotW - 1);
+        const v = sampleAt(tt);
         const y = y0 + (ih - 1) * (1 - v / 255);
         const x = x0 + px;
         if (first) {
@@ -165,30 +417,95 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           ctx.lineTo(x, y);
         }
       }
+      if (!first && (endPx - startPx) % stride !== 0) {
+        const tt = windowStartMs + (span * endPx) / Math.max(1, plotW - 1);
+        const v = sampleAt(tt);
+        ctx.lineTo(x0 + endPx, y0 + (ih - 1) * (1 - v / 255));
+      }
       ctx.strokeStyle = "#5ab0ff";
       ctx.stroke();
     }
+
+    if (frozenVizEnd != null || playbackActiveRef.current) {
+      const duration =
+        playbackDurationRef.current || Math.max(1, vt[vt.length - 1] - vt[0]);
+      if (duration > 0) {
+        const isPlayingNow =
+          playbackActiveRef.current && playbackStartRef.current != null;
+        const elapsed = isPlayingNow
+          ? playbackOffsetRef.current +
+            performance.now() -
+            (playbackStartRef.current ?? 0)
+          : playbackOffsetRef.current;
+        const clampedElapsed = Math.min(Math.max(0, elapsed), duration);
+        const progress = clampedElapsed / duration;
+        const plotX = GUTTER_W;
+        const plotW = Math.max(2, W - GUTTER_W);
+        const cursorX = plotX + progress * (plotW - 1);
+        const label = `${formatPlaybackTime(clampedElapsed)} / ${formatPlaybackTime(
+          duration
+        )}`;
+
+        ctx.save();
+        ctx.strokeStyle = "#ffb454";
+        ctx.fillStyle = "#ffb454";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(cursorX + 0.5, 0);
+        ctx.lineTo(cursorX + 0.5, H);
+        ctx.stroke();
+        ctx.font = "11px Inter, system-ui, -apple-system";
+        ctx.textAlign = "right";
+        ctx.textBaseline = "top";
+        ctx.fillText(label, W - 8, 4);
+        ctx.restore();
+
+        if (isPlayingNow && elapsed >= duration) {
+          if (playbackLoopRef.current) {
+            playbackOffsetRef.current = 0;
+            playbackStartRef.current = performance.now();
+          } else {
+            playbackOffsetRef.current = duration;
+            playbackActiveRef.current = false;
+            playbackStartRef.current = null;
+            setIsPlaying(false);
+          }
+        }
+      }
+    }
   }, []);
 
-  // Universe discovery and data capture
+  useEffect(() => {
+    let unlisten: Promise<UnlistenFn> | null = null;
+    unlisten = listen<Frame>("artnet:dmx", (e) => {
+      const p = e.payload;
+      if (!p) return;
+      const key: UniverseKey = `${p.net}/${p.subnet}/${p.universe}`;
+      universeLastSeenRef.current.set(key, Date.now());
+      setUniverses((prev) => (prev.includes(key) ? prev : [...prev, key]));
+      setSelected((prev) => prev || key);
+    });
+    return () => {
+      unlisten?.then((fn) => fn());
+    };
+  }, []);
+
+  // Universe data capture
   useEffect(() => {
     let unlisten: Promise<UnlistenFn> | null = null;
     unlisten = listen<Frame>("artnet:dmx_filtered", (e) => {
       const p = e.payload;
       if (!p) return;
+      const stamp = Date.now();
+      const values = p.values || [];
       const key: UniverseKey = `${p.net}/${p.subnet}/${p.universe}`;
-      const now = Date.now();
-      universeLastSeenRef.current.set(key, now);
+      universeLastSeenRef.current.set(key, stamp);
       setUniverses((prev) => (prev.includes(key) ? prev : [...prev, key]));
-      if (!selected) setSelected(key);
+      setSelected((prev) => prev || key);
+      if (!isRecording && frozenVizEndRef.current != null) return;
 
-      // Append snapshot only while recording
       if (isRecording) {
-        const values = p.values || [];
-        const now = Date.now();
-
-        // Always save complete data
-        tRef.current.push(now);
+        tRef.current.push(stamp);
         recordChannels.forEach((ch) => {
           const chIdx = Math.min(Math.max(ch - 1, 0), CHANNELS - 1);
           const v = values[chIdx] | 0;
@@ -199,48 +516,82 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           bufRef.current[chIdx] = next;
         });
 
-        // Downsample for visualization
-        const shouldSample =
-          vizTRef.current.length === 0 ||
-          tRef.current.length - vizTRef.current.length >= SAMPLE_RATE;
-
-        if (shouldSample) {
-          vizTRef.current.push(now);
-          for (let ch = 0; ch < CHANNELS; ch++) {
-            const v = values[ch] | 0;
-            const prev = vizBufRef.current[ch];
-            const next = new Uint8Array(prev.length + 1);
-            if (prev.length) next.set(prev, 0);
-            next[prev.length] = v;
-            vizBufRef.current[ch] = next;
-          }
-        }
-
-        // Cleanup visualization data if it gets too large
-        if (vizTRef.current.length > MAX_VIZ_FRAMES) {
-          const keep = Math.floor(MAX_VIZ_FRAMES * 0.8);
-          vizTRef.current = vizTRef.current.slice(-keep);
-          for (let ch = 0; ch < CHANNELS; ch++) {
-            vizBufRef.current[ch] = vizBufRef.current[ch].slice(-keep);
-          }
-        }
-
-        // Cleanup complete data if it gets too large (keep last 2 hours)
         if (tRef.current.length > MAX_COMPLETE_FRAMES) {
-          const keep = Math.floor(MAX_COMPLETE_FRAMES * 0.5); // Keep last 1 hour
+          const keep = Math.floor(MAX_COMPLETE_FRAMES * 0.5);
           tRef.current = tRef.current.slice(-keep);
           for (let ch = 0; ch < CHANNELS; ch++) {
             bufRef.current[ch] = bufRef.current[ch].slice(-keep);
           }
         }
       }
-      // Use setTimeout instead of requestAnimationFrame for background updates
-      setTimeout(() => requestAnimationFrame(draw), 0);
+
+      incomingSeqRef.current += 1;
+      const shouldSample =
+        waveformRows.length > 0 &&
+        (incomingSeqRef.current - 1) % SAMPLE_RATE === 0;
+      if (shouldSample) {
+        vizTRef.current.push(stamp);
+        waveformRows.forEach((dmx) => {
+          const chIdx = Math.min(Math.max(dmx - 1, 0), CHANNELS - 1);
+          const v = values[chIdx] | 0;
+          const prev = vizBufRef.current[chIdx];
+          const next = new Uint8Array(prev.length + 1);
+          if (prev.length) next.set(prev, 0);
+          next[prev.length] = v;
+          vizBufRef.current[chIdx] = next;
+        });
+      }
+
+      if (!isRecording) {
+        trimVizBeforeTime(
+          stamp - VIZ_PREVIEW_WINDOW_MS,
+          waveformRows,
+          vizTRef,
+          vizBufRef
+        );
+      } else if (vizTRef.current.length > MAX_VIZ_FRAMES) {
+        const keep = Math.floor(MAX_VIZ_FRAMES * 0.8);
+        vizTRef.current = vizTRef.current.slice(-keep);
+        waveformRows.forEach((dmx) => {
+          const chIdx = Math.min(Math.max(dmx - 1, 0), CHANNELS - 1);
+          vizBufRef.current[chIdx] = vizBufRef.current[chIdx].slice(-keep);
+        });
+      }
     });
     return () => {
       unlisten?.then((fn) => fn());
     };
-  }, [isRecording, selected, draw, recordChannels]);
+  }, [
+    isRecording,
+    selected,
+    draw,
+    recordChannels,
+    waveformRows,
+  ]);
+
+  useEffect(() => {
+    if (isRecording) return;
+    if (frozenVizEndRef.current != null) return;
+    trimVizBeforeTime(
+      Date.now() - VIZ_PREVIEW_WINDOW_MS,
+      waveformRows,
+      vizTRef,
+      vizBufRef
+    );
+  }, [isRecording, waveformRows]);
+
+  useEffect(() => {
+    const tick = () => {
+      draw();
+      drawRafRef.current = requestAnimationFrame(tick);
+    };
+    drawRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (drawRafRef.current != null) {
+        cancelAnimationFrame(drawRafRef.current);
+      }
+    };
+  }, [draw]);
 
   // TTL prune universes and control blink state for selected
   useEffect(() => {
@@ -328,110 +679,110 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       !window.confirm("Discard current unsaved recording and load file?")
     )
       return;
-    // Detect file format and load accordingly
+
     const isWavFile = newPath.toLowerCase().endsWith(".wav");
     let loadedKey: UniverseKey | "" = "";
+    let vizChannelNums: number[] = [];
+    let nextT: number[] = [];
+    let nextBuf = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
 
-    if (isWavFile) {
-      // Load WAV file
-      const wavData = (await invoke("load_wav_recording", {
-        path: newPath,
-      })) as any;
-
-      console.log("Loaded WAV file with", wavData.timestamps.length, "frames");
-
-      // Populate buffers from WAV data
-      tRef.current = wavData.timestamps;
-      for (let ch = 0; ch < CHANNELS; ch++) {
-        bufRef.current[ch] = new Uint8Array(wavData.channels[ch] || []);
-      }
-      const wavChannels = wavData.channels.map((_: any, idx: number) => idx + 1);
-      setRecordChannels(wavChannels);
-      setChannelsText(wavChannels.join(","));
-    } else {
-      // Load JSONL file
-      const content = (await invoke("read_text_file", {
-        path: newPath,
-      })) as string;
-      console.log("Loaded file content length:", content.length);
-
-      tRef.current = [];
-      bufRef.current = Array.from(
-        { length: CHANNELS },
-        () => new Uint8Array(0)
-      );
-      vizTRef.current = [];
-      vizBufRef.current = Array.from(
-        { length: CHANNELS },
-        () => new Uint8Array(0)
-      );
-      const lines = content.split(/\r?\n/).filter(Boolean);
-      let channels = Array.from({ length: CHANNELS }, (_, idx) => idx + 1);
-      let i = 0;
-      if (
-        lines[0] &&
-        lines[0].includes("format") &&
-        lines[0].includes("artnet-jsonl")
-      ) {
-        const header = JSON.parse(lines[0]);
-        if (Array.isArray(header.channels)) {
-          channels = header.channels.map((n: number) => Number(n) | 0);
-        } else if (typeof header.channel === "number") {
-          channels = [Number(header.channel) | 0];
+    try {
+      if (isWavFile) {
+        let wav: WavRecording;
+        try {
+          wav = (await invoke("load_wav_recording", {
+            path: newPath,
+          })) as WavRecording;
+          if (wav.timestamps.length === 0 || wav.channels.length === 0) {
+            wav = await decodeWavRecording(newPath);
+          }
+        } catch {
+          wav = await decodeWavRecording(newPath);
         }
-        i = 1;
-        setRecordChannels(channels);
-        setChannelsText(channels.join(","));
-      }
-      for (; i < lines.length; i++) {
-        const obj = JSON.parse(lines[i]);
-        const t_ms = obj.t_ms as number;
-        const values = obj.values as number[];
-        if (!loadedKey && obj && typeof obj.net === "number") {
-          loadedKey = `${obj.net | 0}/${obj.subnet | 0}/${obj.universe | 0}`;
-        }
-        tRef.current.push(t_ms);
-        channels.forEach((chNum, idx) => {
-          const ch = Math.min(Math.max(chNum - 1, 0), CHANNELS - 1);
-          const prev = bufRef.current[ch];
-          const next = new Uint8Array(prev.length + 1);
-          if (prev.length) next.set(prev, 0);
-          next[prev.length] = values[idx] | 0;
-          bufRef.current[ch] = next;
+        nextT = wav.timestamps.map((t) => Number(t) || 0);
+        vizChannelNums = normalizeLoadedChannels(
+          wav.dmx_channels && wav.dmx_channels.length === wav.channels.length
+            ? wav.dmx_channels
+            : wav.channels.map((_, idx) => idx + 1)
+        );
+        vizChannelNums.forEach((dmx, idx) => {
+          const chIdx = dmx - 1;
+          const values = wav.channels[idx] || [];
+          nextBuf[chIdx] = new Uint8Array(
+            values.map((value) => Number(value) | 0)
+          );
         });
-      }
-    }
-
-    // Populate visualization buffer from loaded data
-    if (tRef.current.length > 0) {
-      vizTRef.current = [];
-      for (let ch = 0; ch < CHANNELS; ch++) {
-        vizBufRef.current[ch] = new Uint8Array(0);
-      }
-
-      // Downsample the loaded data for visualization
-      const sampleRate = Math.max(
-        1,
-        Math.floor(tRef.current.length / MAX_VIZ_FRAMES)
-      );
-      for (let i = 0; i < tRef.current.length; i += sampleRate) {
-        vizTRef.current.push(tRef.current[i]);
-        for (let ch = 0; ch < CHANNELS; ch++) {
-          const v = bufRef.current[ch][i] || 0;
-          const prev = vizBufRef.current[ch];
-          const next = new Uint8Array(prev.length + 1);
-          if (prev.length) next.set(prev, 0);
-          next[prev.length] = v;
-          vizBufRef.current[ch] = next;
+      } else {
+        const content = (await invoke("read_text_file", {
+          path: newPath,
+        })) as string;
+        const lines = content.split(/\r?\n/).filter(Boolean);
+        let channels = Array.from({ length: CHANNELS }, (_, idx) => idx + 1);
+        let start = 0;
+        if (lines[0]?.includes("format") && lines[0].includes("artnet-jsonl")) {
+          const header = JSON.parse(lines[0]);
+          if (Array.isArray(header.channels)) {
+            channels = normalizeLoadedChannels(header.channels);
+          } else if (typeof header.channel === "number") {
+            channels = normalizeLoadedChannels([header.channel]);
+          }
+          start = 1;
+        }
+        vizChannelNums = normalizeLoadedChannels(channels);
+        for (let i = start; i < lines.length; i++) {
+          const rec = JSON.parse(lines[i]);
+          const values = Array.isArray(rec.values) ? rec.values : [];
+          const t = Number(rec.t_ms) || 0;
+          if (!loadedKey && typeof rec.net === "number") {
+            loadedKey = `${rec.net | 0}/${rec.subnet | 0}/${rec.universe | 0}`;
+          }
+          nextT.push(t);
+          vizChannelNums.forEach((dmx, idx) => {
+            const ch = dmx - 1;
+            const v = Number(values[idx]) | 0;
+            const prev = nextBuf[ch];
+            const next = new Uint8Array(prev.length + 1);
+            if (prev.length) next.set(prev);
+            next[prev.length] = v;
+            nextBuf[ch] = next;
+          });
         }
       }
+      const hasSamples = vizChannelNums.some(
+        (dmx) => nextBuf[dmx - 1]?.length > 0
+      );
+      if (nextT.length === 0 || !hasSamples) {
+        throw new Error("Loaded file contains no drawable samples");
+      }
+    } catch (e) {
+      alert(`Could not load recording: ${String(e)}`);
+      return;
     }
+
+    incomingSeqRef.current = 0;
+    frozenVizEndRef.current = null;
+    tRef.current = nextT.slice();
+    bufRef.current = nextBuf;
+    vizTRef.current = nextT;
+    vizBufRef.current = nextBuf;
+    waveformRowsRef.current = vizChannelNums;
+    setRecordChannels(vizChannelNums);
+    setChannelsText(formatDmxChannelList(vizChannelNums));
+    frozenVizEndRef.current =
+      vizTRef.current.length > 0
+        ? vizTRef.current[vizTRef.current.length - 1]
+        : null;
+    playbackOffsetRef.current = 0;
+    playbackDurationRef.current = Math.max(1, nextT[nextT.length - 1] - nextT[0]);
+    playbackActiveRef.current = false;
+    playbackStartRef.current = null;
+    setIsPlaying(false);
 
     if (loadedKey) {
       setUniverses((prev) =>
         prev.includes(loadedKey) ? prev : [...prev, loadedKey]
       );
-      setSelected((prev) => prev || loadedKey);
+      setSelected(loadedKey);
     }
     setPath(newPath);
     requestAnimationFrame(draw);
@@ -439,6 +790,8 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
 
   const toggleRecord = useCallback(() => {
     if (!isRecording) {
+      frozenVizEndRef.current = null;
+      incomingSeqRef.current = 0;
       tRef.current = [];
       bufRef.current = Array.from(
         { length: CHANNELS },
@@ -451,9 +804,20 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       );
       setIsRecording(true);
     } else {
+      frozenVizEndRef.current =
+        vizTRef.current.length > 0
+          ? vizTRef.current[vizTRef.current.length - 1]
+          : Date.now();
+      playbackOffsetRef.current = 0;
+      playbackDurationRef.current = Math.max(
+        1,
+        (vizTRef.current[vizTRef.current.length - 1] ?? 0) -
+          (vizTRef.current[0] ?? 0)
+      );
       setIsRecording(false);
+      requestAnimationFrame(draw);
     }
-  }, [isRecording]);
+  }, [draw, isRecording]);
 
   const saveToFile = useCallback(async () => {
     if (tRef.current.length === 0) return;
@@ -481,6 +845,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         sampleRate,
         data: {
           timestamps: tRef.current.map((t) => t - t0),
+          dmx_channels: recordChannels,
           channels: recordChannels.map((ch) =>
             Array.from(
               bufRef.current[Math.min(Math.max(ch - 1, 0), CHANNELS - 1)]
@@ -533,37 +898,175 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     setPath(String(p));
   }, [selected, recordingFormat, recordChannels]);
 
-  const togglePlay = useCallback(async () => {
-    if (!isPlaying) {
+  const getPlaybackDuration = useCallback(() => {
+    const firstT = vizTRef.current[0] ?? tRef.current[0] ?? 0;
+    const lastT =
+      vizTRef.current[vizTRef.current.length - 1] ??
+      tRef.current[tRef.current.length - 1] ??
+      firstT;
+    return Math.max(1, lastT - firstT);
+  }, []);
+
+  const outputSeekedFrame = useCallback(
+    async (offsetMs: number) => {
+      const vt = vizTRef.current;
+      if (vt.length === 0) return;
+      const target = vt[0] + offsetMs;
+      let idx = 0;
+      while (idx < vt.length - 1 && vt[idx + 1] <= target) idx++;
+      const values = Array.from({ length: CHANNELS }, (_, ch) => {
+        const buf = vizBufRef.current[ch];
+        return buf?.[Math.min(idx, Math.max(0, buf.length - 1))] ?? 0;
+      });
+      const isWavFile = path.toLowerCase().endsWith(".wav");
+      const [net, subnet, universe] =
+        selected && !isWavFile
+          ? selected.split("/").map((value) => Number(value) | 0)
+          : [undefined, undefined, undefined];
+      await invoke("send_dmx_values", {
+        values,
+        net,
+        subnet,
+        universe,
+      }).catch(() => {});
+    },
+    [path, selected]
+  );
+
+  const seekTimelineFromClientX = useCallback(
+    (clientX: number) => {
+      const container = containerRef.current;
+      if (!container || frozenVizEndRef.current == null) return false;
+      const rect = container.getBoundingClientRect();
+      const plotX = GUTTER_W;
+      const plotW = Math.max(2, rect.width - GUTTER_W);
+      const x = Math.min(Math.max(clientX - rect.left, plotX), plotX + plotW);
+      const progress = (x - plotX) / plotW;
+      playbackDurationRef.current = getPlaybackDuration();
+      playbackOffsetRef.current = Math.min(
+        playbackDurationRef.current,
+        Math.max(0, progress * playbackDurationRef.current)
+      );
+      playbackStartRef.current = performance.now();
+      requestAnimationFrame(draw);
+      void outputSeekedFrame(playbackOffsetRef.current);
+      return true;
+    },
+    [draw, getPlaybackDuration, outputSeekedFrame]
+  );
+
+  const startPlaybackFromOffset = useCallback(
+    async (offsetMs = playbackOffsetRef.current) => {
       if (!path) {
         alert("Please load or save a recording to play.");
         return;
       }
-      setIsPlaying(true);
+      const duration = getPlaybackDuration();
+      const startMs = Math.min(Math.max(0, offsetMs), duration);
+      const playStartMs = startMs >= duration ? 0 : startMs;
 
-      // Detect format and play accordingly
-      const isWavFile = path.toLowerCase().endsWith(".wav");
-      if (isWavFile) {
-        await invoke("play_wav_file", { path });
-      } else {
-        await invoke("play_file", { path });
+      try {
+        const isWavFile = path.toLowerCase().endsWith(".wav");
+        if (isWavFile) {
+          await invoke("play_wav_file", {
+            path,
+            startMs: Math.round(playStartMs),
+            loopPlayback: isLooping,
+          });
+        } else {
+          await invoke("play_file", {
+            path,
+            startMs: Math.round(playStartMs),
+            loopPlayback: isLooping,
+          });
+        }
+        playbackDurationRef.current = duration;
+        playbackOffsetRef.current = playStartMs;
+        playbackStartRef.current = performance.now();
+        playbackActiveRef.current = true;
+        setIsPlaying(true);
+        requestAnimationFrame(draw);
+      } catch (e) {
+        playbackActiveRef.current = false;
+        playbackStartRef.current = null;
+        alert(`Could not start playback: ${String(e)}`);
       }
+    },
+    [draw, getPlaybackDuration, isLooping, path]
+  );
+
+  const togglePlay = useCallback(async () => {
+    if (!isPlaying) {
+      await startPlaybackFromOffset();
     } else {
+      const duration = playbackDurationRef.current || getPlaybackDuration();
+      if (playbackStartRef.current != null) {
+        playbackOffsetRef.current = Math.min(
+          duration,
+          playbackOffsetRef.current + performance.now() - playbackStartRef.current
+        );
+      }
       await invoke("stop_playback");
+      playbackActiveRef.current = false;
+      playbackStartRef.current = null;
       setIsPlaying(false);
+      requestAnimationFrame(draw);
     }
-  }, [isPlaying, path]);
+  }, [draw, getPlaybackDuration, isPlaying, startPlaybackFromOffset]);
+
+  const handleTimelinePointerDown = useCallback(
+    (e: PointerEvent<HTMLDivElement>) => {
+      if (frozenVizEndRef.current == null) return;
+      e.preventDefault();
+      timelineDragActiveRef.current = true;
+      timelineDragWasPlayingRef.current = playbackActiveRef.current;
+      e.currentTarget.setPointerCapture(e.pointerId);
+      if (timelineDragWasPlayingRef.current) {
+        playbackActiveRef.current = false;
+        playbackStartRef.current = null;
+        setIsPlaying(false);
+        void invoke("stop_playback");
+      }
+      seekTimelineFromClientX(e.clientX);
+    },
+    [seekTimelineFromClientX]
+  );
+
+  const handleTimelinePointerMove = useCallback(
+    (e: PointerEvent<HTMLDivElement>) => {
+      if (!timelineDragActiveRef.current) return;
+      e.preventDefault();
+      seekTimelineFromClientX(e.clientX);
+    },
+    [seekTimelineFromClientX]
+  );
+
+  const finishTimelineDrag = useCallback(
+    (e: PointerEvent<HTMLDivElement>, restartPlayback: boolean) => {
+      if (!timelineDragActiveRef.current) return;
+      timelineDragActiveRef.current = false;
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+      if (restartPlayback && timelineDragWasPlayingRef.current) {
+        void startPlaybackFromOffset(playbackOffsetRef.current);
+      }
+      timelineDragWasPlayingRef.current = false;
+    },
+    [startPlaybackFromOffset]
+  );
 
   const clearBuffer = useCallback(() => {
+    frozenVizEndRef.current = null;
+    playbackOffsetRef.current = 0;
+    playbackDurationRef.current = 0;
+    playbackActiveRef.current = false;
+    playbackStartRef.current = null;
+    resetVisualization();
     tRef.current = [];
     bufRef.current = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
-    vizTRef.current = [];
-    vizBufRef.current = Array.from(
-      { length: CHANNELS },
-      () => new Uint8Array(0)
-    );
     requestAnimationFrame(draw);
-  }, [draw]);
+  }, [draw, resetVisualization]);
 
   // Open settings and load current sender config
   const openSettings = useCallback(async () => {
@@ -608,13 +1111,23 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     setShowSettings(false);
   }, [settings]);
 
+  const activityColor = isRecording ? "#ff4d4d" : "#2da8ff";
+  const activityGlow = isRecording
+    ? "0 0 8px rgba(255,77,77,0.9)"
+    : "0 0 8px rgba(45,168,255,0.9)";
+
   return (
     <section className="view active">
       <div className="controls">
         <div className="controls-left">
           <select
             value={selected}
-            onChange={(e) => setSelected(e.currentTarget.value)}
+            onChange={(e) => {
+              const v = e.currentTarget.value;
+              resetVisualization();
+              setSelected(v);
+              requestAnimationFrame(draw);
+            }}
             className="animation-select"
           >
             {universes.length === 0 && <option value="">No universes</option>}
@@ -636,19 +1149,26 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
             <option value="wav">WAV (Binary)</option>
           </select>
           <label className="animation-label">Channels:</label>
+          <span
+            className="recordplay-help"
+            tabIndex={0}
+            data-tooltip="Waveforms update live from DMX on the selected universe. Use comma or space-separated slots (1-512), inclusive ranges like 3-18, or both, e.g. 1-10, 1, 5, 192. Order is preserved; repeats are dropped. Recording writes only those channels to JSONL/WAV."
+          >
+            ?
+          </span>
           <input
             type="text"
             value={channelsText}
             onChange={(e) => {
               const text = e.target.value;
+              const channels = parseDmxChannelList(text, CHANNELS);
               setChannelsText(text);
-              const nums = text
-                .split(/[\,\s]+/)
-                .map((s) => parseInt(s, 10))
-                .filter((n) => !isNaN(n) && n >= 1 && n <= CHANNELS);
-              setRecordChannels(Array.from(new Set(nums)));
+              resetVisualization();
+              waveformRowsRef.current = channels;
+              setRecordChannels(channels);
+              requestAnimationFrame(draw);
             }}
-            className="freq-input"
+            className="freq-input record-channels-input"
           />
           <span
             title={blink ? "DMX activity" : "No recent frames"}
@@ -658,8 +1178,8 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
               height: 12,
               marginLeft: 8,
               borderRadius: 6,
-              background: blink ? "#2da8ff" : "#244860",
-              boxShadow: blink ? "0 0 8px rgba(45,168,255,0.9)" : "none",
+              background: blink ? activityColor : "#244860",
+              boxShadow: blink ? activityGlow : "none",
               transition: "background 0.1s",
             }}
           />
@@ -669,8 +1189,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           <button
             className="btn"
             onClick={clearBuffer}
-            disabled={tRef.current.length === 0 && !isRecording}
-            title="Clear captured buffer"
+            title="Clear current curves"
           >
             Clear
           </button>
@@ -687,7 +1206,14 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           <button className="btn" onClick={togglePlay}>
             {isPlaying ? "Stop" : "Play"}
           </button>
-          <span className="status">{path}</span>
+          <label className="animation-label">
+            <input
+              type="checkbox"
+              checked={isLooping}
+              onChange={(e) => setIsLooping(e.currentTarget.checked)}
+            />{" "}
+            Loop
+          </label>
         </div>
         <div className="controls-right">
           <button
@@ -699,13 +1225,21 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           </button>
         </div>
       </div>
+      {path && (
+        <div className="recordplay-file-path" title={path}>
+          {path}
+        </div>
+      )}
       <div
         ref={containerRef}
         onScroll={(e) => {
           scrollTopRef.current = (e.target as HTMLDivElement).scrollTop;
-          // Use setTimeout to ensure updates continue in background
-          setTimeout(() => requestAnimationFrame(draw), 0);
+          draw();
         }}
+        onPointerDown={handleTimelinePointerDown}
+        onPointerMove={handleTimelinePointerMove}
+        onPointerUp={(e) => finishTimelineDrag(e, true)}
+        onPointerCancel={(e) => finishTimelineDrag(e, false)}
         style={{
           width: "100%",
           height: "calc(100vh - 220px)",
@@ -715,94 +1249,32 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           position: "relative",
           border: "1px solid var(--glass-border)",
           background: "var(--glass-bg)",
+          cursor: path ? "crosshair" : "default",
           backdropFilter: "var(--blur)" as any,
         }}
       >
-        <div style={{ height: CHANNELS * CELL_H }}>
-          {(() => {
-            const scrollTop = scrollTopRef.current;
-            const containerHeight = containerRef.current?.clientHeight || 360;
-            const startRow = Math.max(0, Math.floor(scrollTop / CELL_H) - 5);
-            const endRow = Math.min(
-              CHANNELS - 1,
-              Math.ceil((scrollTop + containerHeight) / CELL_H) + 5
-            );
-
-            return Array.from({ length: endRow - startRow + 1 }, (_, i) => {
-              const ch = startRow + i;
-              const vals = vizBufRef.current[ch]; // Use visualization data
-              const hasData = vals && vals.length > 0;
-
-              return (
-                <div
-                  key={ch}
-                  style={{
-                    position: "absolute",
-                    top: ch * CELL_H,
-                    left: 0,
-                    right: 0,
-                    height: CELL_H,
-                    display: "flex",
-                    alignItems: "center",
-                    padding: "0 8px",
-                    borderBottom: "1px solid rgba(255,255,255,0.08)",
-                    background:
-                      ch % 2 === 0
-                        ? "rgba(255,255,255,0.02)"
-                        : "rgba(255,255,255,0.03)",
-                  }}
-                >
-                  <div
-                    style={{
-                      width: GUTTER_W - 8,
-                      textAlign: "right",
-                      color: "#9fb3c8",
-                      fontSize: "12px",
-                      fontFamily: "Inter, system-ui, -apple-system",
-                    }}
-                  >
-                    {ch + 1}
-                  </div>
-                  <div
-                    style={{
-                      flex: 1,
-                      height: CELL_H - 6,
-                      position: "relative",
-                      background: "transparent",
-                    }}
-                  >
-                    {hasData && (
-                      <svg
-                        width="100%"
-                        height="100%"
-                        style={{ display: "block" }}
-                        viewBox={`0 0 ${
-                          containerRef.current?.clientWidth || 800
-                        } ${CELL_H - 6}`}
-                        preserveAspectRatio="none"
-                      >
-                        <polyline
-                          points={Array.from(vals)
-                            .map((v, i) => {
-                              const x =
-                                (i / (vals.length - 1)) *
-                                (containerRef.current?.clientWidth || 800);
-                              const y = (CELL_H - 6) * (1 - v / 255);
-                              return `${x},${y}`;
-                            })
-                            .join(" ")}
-                          fill="none"
-                          stroke="#5ab0ff"
-                          strokeWidth="1.2"
-                        />
-                      </svg>
-                    )}
-                  </div>
-                </div>
-              );
-            });
-          })()}
+        <div
+          style={{
+            height: 0,
+            position: "sticky",
+            top: 0,
+            zIndex: 1,
+            pointerEvents: "none",
+          }}
+        >
+          <canvas
+            ref={canvasRef}
+            style={{
+              display: "block",
+              pointerEvents: "none",
+            }}
+          />
         </div>
+        {waveformRows.length === 0 ? (
+          <div className="recordplay-waveform-empty" aria-hidden="true" />
+        ) : (
+          <div style={{ height: waveformRows.length * CELL_H }} />
+        )}
       </div>
       {showSettings && settings && (
         <div

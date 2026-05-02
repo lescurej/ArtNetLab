@@ -77,6 +77,10 @@ interface FaderProps {
     modifiers: { additive: boolean; range: boolean }
   ) => void;
   onActivateChannel: (channel: number) => void;
+  onSliderInteractionStart: (
+    channel: number,
+    e: React.PointerEvent<Element>
+  ) => void;
   setInputRef: (channel: number, el: HTMLInputElement | null) => void;
   setCardRef: (channel: number, el: HTMLDivElement | null) => void;
   onFader: (i: number, v: number) => Promise<void>;
@@ -92,6 +96,7 @@ const FaderBase = ({
   interactionsLocked,
   onSelectChannel,
   onActivateChannel,
+  onSliderInteractionStart,
   setInputRef,
   setCardRef,
   onFader,
@@ -193,6 +198,7 @@ const FaderBase = ({
         thumbSize={20}
         ariaLabel={`Channel ${channel + 1}`}
         onChange={onSliderChange}
+        onInteractionStart={(e) => onSliderInteractionStart(channel, e)}
         disabled={interactionsLocked}
       />
       <input
@@ -215,7 +221,8 @@ const Fader = memo(FaderBase, (prev, next) => {
     prev.channel === next.channel &&
     prev.selected === next.selected &&
     prev.animated === next.animated &&
-    prev.interactionsLocked === next.interactionsLocked
+    prev.interactionsLocked === next.interactionsLocked &&
+    prev.onSliderInteractionStart === next.onSliderInteractionStart
   );
 });
 
@@ -385,6 +392,14 @@ export default function SenderTab({
   const setAnchor = useCallback((channel: number) => {
     selectionAnchorRef.current = channel;
   }, []);
+  const commitSelectedChannel = useCallback((channel: number) => {
+    selectedChannelRef.current = channel;
+    setSelectedChannel(channel);
+  }, []);
+  const commitSelectedChannels = useCallback((channels: Set<number>) => {
+    selectedChannelsRef.current = channels;
+    setSelectedChannels(channels);
+  }, []);
   const hasAnimation = channelAnimationModes.some((mode) => mode !== "off");
   const animationModeCodes = useMemo(
     () => channelAnimationModes.map(animationModeToCode),
@@ -532,8 +547,13 @@ export default function SenderTab({
     []
   );
   const activateChannel = useCallback((channel: number) => {
-    setSelectedChannel(channel);
-  }, []);
+    const alreadySelected = selectedChannelsRef.current.has(channel);
+    commitSelectedChannel(channel);
+    if (!alreadySelected) {
+      commitSelectedChannels(new Set([channel]));
+      setAnchor(channel);
+    }
+  }, [commitSelectedChannel, commitSelectedChannels, setAnchor]);
   const handleChannelSelect = useCallback(
     (
       channel: number,
@@ -547,56 +567,73 @@ export default function SenderTab({
         currentSelected.size === 1
           ? Array.from(currentSelected)[0]
           : currentSelectedChannel;
-      setSelectedChannel(channel);
-      setSelectedChannels((prev) => {
-        if (modifiers.range) {
-          const lo = Math.min(anchor, channel);
-          const hi = Math.max(anchor, channel);
-          const rangeSet = new Set<number>();
-          for (let ch = lo; ch <= hi; ch++) rangeSet.add(ch);
-          if (!modifiers.additive) {
-            return rangeSet;
-          }
-          const allAlreadySelected = Array.from(rangeSet).every((ch) =>
-            prev.has(ch)
-          );
-          const next = new Set(prev);
-          if (allAlreadySelected) {
-            for (const ch of rangeSet) next.delete(ch);
-            if (next.size === 0) next.add(channel);
-            return next;
-          }
-          for (const ch of rangeSet) next.add(ch);
-          return next;
+      commitSelectedChannel(channel);
+      if (modifiers.range) {
+        const lo = Math.min(anchor, channel);
+        const hi = Math.max(anchor, channel);
+        const rangeSet = new Set<number>();
+        for (let ch = lo; ch <= hi; ch++) rangeSet.add(ch);
+        if (!modifiers.additive) {
+          commitSelectedChannels(rangeSet);
+          return;
         }
-        if (modifiers.additive) {
-          const next = new Set(prev);
-          if (next.has(channel)) {
-            if (next.size > 1) next.delete(channel);
-          } else {
-            next.add(channel);
-          }
-          return next;
+        const allAlreadySelected = Array.from(rangeSet).every((ch) =>
+          currentSelected.has(ch)
+        );
+        const next = new Set(currentSelected);
+        if (allAlreadySelected) {
+          for (const ch of rangeSet) next.delete(ch);
+          if (next.size === 0) next.add(channel);
+          commitSelectedChannels(next);
+          return;
         }
-        setAnchor(channel);
-        return new Set([channel]);
-      });
-      if (!modifiers.range) setAnchor(channel);
+        for (const ch of rangeSet) next.add(ch);
+        commitSelectedChannels(next);
+        return;
+      }
+      if (modifiers.additive) {
+        const next = new Set(currentSelected);
+        if (next.has(channel)) {
+          if (next.size > 1) next.delete(channel);
+        } else {
+          next.add(channel);
+        }
+        commitSelectedChannels(next);
+        return;
+      }
+      setAnchor(channel);
+      commitSelectedChannels(new Set([channel]));
     },
-    [setAnchor]
+    [commitSelectedChannel, commitSelectedChannels, setAnchor]
+  );
+  const handleSliderInteractionStart = useCallback(
+    (channel: number, e: React.PointerEvent<Element>) => {
+      if (suppressClickRef.current) return;
+      const additive = e.metaKey || e.ctrlKey;
+      const range = e.shiftKey;
+      if (additive || range) {
+        handleChannelSelect(channel, { additive, range });
+        return;
+      }
+      const selected = selectedChannelsRef.current;
+      if (selected.size > 1 && !selected.has(channel)) {
+        handleChannelSelect(channel, { additive: false, range: false });
+      }
+    },
+    [handleChannelSelect]
   );
   const focusChannel = useCallback(
     (channel: number) => {
       const next = Math.max(0, Math.min(DMX_CHANNELS - 1, channel));
-      setSelectedChannel(next);
-      setSelectedChannels(new Set([next]));
+      commitSelectedChannel(next);
+      commitSelectedChannels(new Set([next]));
       setAnchor(next);
       rowVirtualizerRef.current?.scrollToIndex(Math.floor(next / FADER_COLS), {
         align: "auto",
       });
       requestAnimationFrame(() => channelInputsRef.current[next]?.focus());
     },
-    []
+    [commitSelectedChannel, commitSelectedChannels, setAnchor]
   );
 
   const handleMarqueeStart = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
@@ -652,18 +689,18 @@ export default function SenderTab({
           hit.add(ch);
         }
       }
-      setSelectedChannels((prev) => {
-        if (!additiveMarquee) {
-          if (hit.size === 0) return new Set([selectedChannel]);
-          return hit;
-        }
-        const next = new Set(prev);
+      if (!additiveMarquee) {
+        commitSelectedChannels(
+          hit.size === 0 ? new Set([selectedChannelRef.current]) : hit
+        );
+      } else {
+        const next = new Set(selectedChannelsRef.current);
         for (const ch of hit) next.add(ch);
-        return next;
-      });
+        commitSelectedChannels(next);
+      }
       if (hit.size > 0) {
         const first = Math.min(...hit);
-        setSelectedChannel(first);
+        commitSelectedChannel(first);
         setAnchor(first);
       }
     };
@@ -680,7 +717,7 @@ export default function SenderTab({
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
-  }, [selectedChannel]);
+  }, [commitSelectedChannel, commitSelectedChannels, setAnchor]);
 
   const handleSenderKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLElement>) => {
@@ -699,9 +736,9 @@ export default function SenderTab({
           Array.from({ length: DMX_CHANNELS }, (_, i) => i)
         );
         senderPaneRef.current?.focus();
-        setSelectedChannels(allChannels);
+        commitSelectedChannels(allChannels);
         setAnchor(0);
-        setSelectedChannel(0);
+        commitSelectedChannel(0);
         return;
       }
 
@@ -726,8 +763,8 @@ export default function SenderTab({
           const hi = Math.max(anchor, next);
           const range = new Set<number>();
           for (let ch = lo; ch <= hi; ch++) range.add(ch);
-          setSelectedChannel(next);
-          setSelectedChannels(range);
+          commitSelectedChannel(next);
+          commitSelectedChannels(range);
           return;
         }
         if (selectedChannels.size > 1) {
@@ -746,8 +783,8 @@ export default function SenderTab({
           const hi = Math.max(anchor, next);
           const range = new Set<number>();
           for (let ch = lo; ch <= hi; ch++) range.add(ch);
-          setSelectedChannel(next);
-          setSelectedChannels(range);
+          commitSelectedChannel(next);
+          commitSelectedChannels(range);
           return;
         }
         if (selectedChannels.size > 1) {
@@ -773,7 +810,16 @@ export default function SenderTab({
         }
       }
     },
-    [faders, focusChannel, selectedChannel, selectedChannels, stableOnFader]
+    [
+      commitSelectedChannel,
+      commitSelectedChannels,
+      faders,
+      focusChannel,
+      selectedChannel,
+      selectedChannels,
+      setAnchor,
+      stableOnFader,
+    ]
   );
 
   const rowVirtualizer = useVirtualizer({
@@ -949,6 +995,7 @@ export default function SenderTab({
                         interactionsLocked={marquee !== null}
                         onSelectChannel={handleChannelSelect}
                         onActivateChannel={activateChannel}
+                        onSliderInteractionStart={handleSliderInteractionStart}
                         setInputRef={setChannelInputRef}
                         setCardRef={setFaderCardRef}
                         onFader={stableOnFader}

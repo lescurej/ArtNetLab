@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -328,6 +329,7 @@ fn normalize_channels(channels: Vec<usize>) -> Vec<usize> {
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     shared_udp: Arc<tokio::sync::Mutex<Option<Arc<UdpSocket>>>>,
+    discovery_poll_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<(SocketAddr, Vec<u8>)>>>>,
 }
 
 struct Inner {
@@ -337,6 +339,7 @@ struct Inner {
     // Sender
     send_cfg: SenderConfig,
     send_task: Option<JoinHandle<()>>,
+    discovery_interval_sec: u64,
     channels: [u8; 512],
     sequence: u8,
     // Recording
@@ -360,6 +363,7 @@ impl Default for AppState {
                 recv_task: None,
                 send_cfg: SenderConfig::default(),
                 send_task: None,
+                discovery_interval_sec: 10,
                 channels: [0; 512],
                 sequence: 0,
                 record_tx: None,
@@ -371,6 +375,7 @@ impl Default for AppState {
                 event_filter: None,
             })),
             shared_udp: Arc::new(tokio::sync::Mutex::new(None)),
+            discovery_poll_tx: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }
@@ -378,6 +383,13 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub async fn set_discovery_poll_reply_tx(
+        &self,
+        tx: Option<mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    ) {
+        *self.discovery_poll_tx.lock().await = tx;
     }
 
     pub async fn udp_for_send(&self) -> Result<Arc<UdpSocket>> {
@@ -407,6 +419,14 @@ impl AppState {
     }
     pub fn set_sender_config(&self, cfg: SenderConfig) {
         self.inner.lock().unwrap().send_cfg = cfg;
+    }
+
+    pub fn get_discovery_interval_sec(&self) -> u64 {
+        self.inner.lock().unwrap().discovery_interval_sec
+    }
+
+    pub fn set_discovery_interval_sec(&self, sec: u64) {
+        self.inner.lock().unwrap().discovery_interval_sec = sec.min(86400);
     }
 
     pub fn snapshot_channels(&self) -> [u8; 512] {
@@ -716,7 +736,7 @@ pub async fn run_receiver_task(
     let mut buf = [0u8; 2048];
 
     loop {
-        let (n, _from) = sock.recv_from(&mut buf).await?;
+        let (n, from) = sock.recv_from(&mut buf).await?;
 
         if let Ok(frame) = artnet::parse_artdmx(&buf[..n]) {
             let _ = window.emit("artnet:dmx", &frame);
@@ -742,6 +762,14 @@ pub async fn run_receiver_task(
             }
             if let Some(tx) = recorder_tx {
                 let _ = tx.send(frame);
+            }
+        } else if n >= 10 && &buf[..8] == b"Art-Net\0" {
+            let op = u16::from_le_bytes([buf[8], buf[9]]);
+            if op == 0x2100 {
+                let gate = app_state.discovery_poll_tx.lock().await;
+                if let Some(ref tx) = *gate {
+                    let _ = tx.try_send((from, buf[..n].to_vec()));
+                }
             }
         }
     }
@@ -795,88 +823,114 @@ pub async fn run_record_task(
     Ok(())
 }
 
-pub async fn run_play_task(path: String, cfg: SenderConfig) -> Result<()> {
+pub async fn run_play_task(
+    path: String,
+    cfg: SenderConfig,
+    start_ms: u64,
+    loop_playback: bool,
+) -> Result<()> {
     use std::io::{BufRead, BufReader};
     let sock = artnet::sender_socket().await?;
-    let file = std::fs::File::open(&path)?;
-    let mut lines = BufReader::new(file).lines();
-    let mut first = true;
-    let mut channels: Vec<usize> = (1..=512).collect();
-    let mut last_t: Option<u64> = None;
-    while let Some(line) = lines.next() {
-        let line = line?;
-        if first {
-            first = false;
-            // If header, parse channels mapping and continue
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                if val.get("format").is_some() {
-                    if let Some(arr) = val.get("channels").and_then(|v| v.as_array()) {
-                        channels = arr
-                            .iter()
-                            .filter_map(|n| n.as_u64().map(|x| x as usize))
-                            .collect();
+    let mut active_start_ms = start_ms;
+    loop {
+        let file = std::fs::File::open(&path)?;
+        let mut lines = BufReader::new(file).lines();
+        let mut first = true;
+        let mut channels: Vec<usize> = (1..=512).collect();
+        let mut last_t: Option<u64> = None;
+        while let Some(line) = lines.next() {
+            let line = line?;
+            if first {
+                first = false;
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if val.get("format").is_some() {
+                        if let Some(arr) = val.get("channels").and_then(|v| v.as_array()) {
+                            channels = arr
+                                .iter()
+                                .filter_map(|n| n.as_u64().map(|x| x as usize))
+                                .collect();
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
-        }
-        #[derive(serde::Deserialize)]
-        struct Line {
-            t_ms: u64,
-            net: u8,
-            subnet: u8,
-            universe: u8,
-            values: Vec<u8>,
-        }
-        let rec: Line = serde_json::from_str(&line)?;
-        if let Some(prev) = last_t {
-            let delta = rec.t_ms.saturating_sub(prev);
-            if delta > 0 {
-                sleep(Duration::from_millis(delta)).await;
+            #[derive(serde::Deserialize)]
+            struct Line {
+                t_ms: u64,
+                net: u8,
+                subnet: u8,
+                universe: u8,
+                values: Vec<u8>,
             }
-        }
-        last_t = Some(rec.t_ms);
-        // Use rec addressing for subuni/net
-        let mut send_cfg = cfg.clone();
-        send_cfg.net = rec.net;
-        send_cfg.subnet = rec.subnet;
-        send_cfg.universe = rec.universe;
-        let mut arr = [0u8; 512];
-        for (idx, ch) in channels.iter().enumerate() {
-            if idx < rec.values.len() && *ch >= 1 && *ch <= 512 {
-                arr[*ch - 1] = rec.values[idx];
+            let rec: Line = serde_json::from_str(&line)?;
+            if rec.t_ms < active_start_ms {
+                continue;
             }
+            if let Some(prev) = last_t {
+                let delta = rec.t_ms.saturating_sub(prev);
+                if delta > 0 {
+                    sleep(Duration::from_millis(delta)).await;
+                }
+            }
+            last_t = Some(rec.t_ms);
+            let mut send_cfg = cfg.clone();
+            send_cfg.net = rec.net;
+            send_cfg.subnet = rec.subnet;
+            send_cfg.universe = rec.universe;
+            let mut arr = [0u8; 512];
+            for (idx, ch) in channels.iter().enumerate() {
+                if idx < rec.values.len() && *ch >= 1 && *ch <= 512 {
+                    arr[*ch - 1] = rec.values[idx];
+                }
+            }
+            let _ = crate::artnet::send_artdmx(&sock, &send_cfg, &arr, 0).await;
         }
-        let _ = crate::artnet::send_artdmx(&sock, &send_cfg, &arr, 0).await;
+        if !loop_playback {
+            break;
+        }
+        active_start_ms = 0;
     }
     Ok(())
 }
 
 // WAV playback task
-pub async fn run_wav_play_task(wav_data: crate::WavRecordingData, cfg: SenderConfig) -> Result<()> {
+pub async fn run_wav_play_task(
+    wav_data: crate::WavRecordingData,
+    cfg: SenderConfig,
+    start_ms: u64,
+    loop_playback: bool,
+) -> Result<()> {
     let sock = artnet::sender_socket().await?;
-    let mut last_t: Option<u64> = None;
-
-    for frame_idx in 0..wav_data.timestamps.len() {
-        let t_ms = wav_data.timestamps[frame_idx];
-
-        if let Some(prev) = last_t {
-            let delta = t_ms.saturating_sub(prev);
-            if delta > 0 {
-                sleep(Duration::from_millis(delta)).await;
+    let mut active_start_ms = start_ms;
+    loop {
+        let mut last_t: Option<u64> = None;
+        for frame_idx in 0..wav_data.timestamps.len() {
+            let t_ms = wav_data.timestamps[frame_idx];
+            if t_ms < active_start_ms {
+                continue;
             }
-        }
-        last_t = Some(t_ms);
 
-        // Create DMX frame from WAV data
-        let mut arr = [0u8; 512];
-        for ch in 0..512 {
-            if ch < wav_data.channels.len() && frame_idx < wav_data.channels[ch].len() {
-                arr[ch] = wav_data.channels[ch][frame_idx];
+            if let Some(prev) = last_t {
+                let delta = t_ms.saturating_sub(prev);
+                if delta > 0 {
+                    sleep(Duration::from_millis(delta)).await;
+                }
             }
-        }
+            last_t = Some(t_ms);
 
-        let _ = artnet::send_artdmx(&sock, &cfg, &arr, 0).await;
+            let mut arr = [0u8; 512];
+            for ch in 0..512 {
+                if ch < wav_data.channels.len() && frame_idx < wav_data.channels[ch].len() {
+                    arr[ch] = wav_data.channels[ch][frame_idx];
+                }
+            }
+
+            let _ = artnet::send_artdmx(&sock, &cfg, &arr, 0).await;
+        }
+        if !loop_playback {
+            break;
+        }
+        active_start_ms = 0;
     }
     Ok(())
 }

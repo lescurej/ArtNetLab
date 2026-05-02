@@ -15,6 +15,7 @@ interface SliderProps {
   className?: string;
   ariaLabel?: string;
   disabled?: boolean;
+  onInteractionStart?: (e: React.PointerEvent<HTMLDivElement>) => void;
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -39,6 +40,7 @@ export default function Slider({
   className = "",
   ariaLabel,
   disabled = false,
+  onInteractionStart,
 }: SliderProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
@@ -84,6 +86,7 @@ export default function Slider({
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (disabled) return;
+      onInteractionStart?.(e);
       draggingRef.current = true;
       dragMovedRef.current = false;
       dragStartRef.current = { x: e.clientX, y: e.clientY };
@@ -91,7 +94,7 @@ export default function Slider({
       const r = coordsFromPointer(e.clientX, e.clientY);
       commitRatio(r);
     },
-    [coordsFromPointer, commitRatio, disabled]
+    [coordsFromPointer, commitRatio, disabled, onInteractionStart]
   );
 
   // Throttle move handling to animation frames for smoother updates

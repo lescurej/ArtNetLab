@@ -42,12 +42,12 @@ const ChannelComponent = ({
   }, [channel.height, valueBarHeight]);
 
   // Memoize font sizes - optimized for smaller cells
-  const valueFontSize = useMemo(() => {
-    return Math.min(10, Math.max(6, channel.height * 0.6));
+  const channelFontSize = useMemo(() => {
+    return Math.min(14, Math.max(8, channel.height * 0.5));
   }, [channel.height]);
 
-  const channelFontSize = useMemo(() => {
-    return Math.min(8, Math.max(4, channel.height * 0.4));
+  const valueFontSize = useMemo(() => {
+    return Math.min(8, Math.max(5, channel.height * 0.4));
   }, [channel.height]);
 
   return (
@@ -79,29 +79,29 @@ const ChannelComponent = ({
         />
       )}
 
-      {/* Value text (centered horizontally) */}
       <Text
         x={0}
-        y={channel.height * 0.05}
+        y={channel.height * 0.08}
         width={channel.width}
-        text={String(value)}
-        fontSize={valueFontSize}
+        height={channel.height * 0.55}
+        text={String(channel.channel)}
+        fontSize={channelFontSize}
         fontFamily="Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial"
         fontStyle="bold"
-        fill="#e6f0ff"
+        fill="#eaf2fb"
         align="center"
+        verticalAlign="middle"
       />
 
-      {/* Channel number (centered horizontally) */}
       <Text
         x={0}
         y={channel.height * 0.6}
         width={channel.width}
-        text={String(channel.channel)}
-        fontSize={channelFontSize}
+        text={String(value)}
+        fontSize={valueFontSize}
         fontFamily="Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial"
-        fontStyle="300"
-        fill="#9fb3c8"
+        fontStyle="normal"
+        fill="#73899e"
         align="center"
       />
     </Group>

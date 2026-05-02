@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod artnet;
+mod discovery;
 mod state;
 
-use std::{fs, path::PathBuf};
+use std::{collections::HashSet, fs, path::PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -11,10 +12,27 @@ use state::{AppState, PreviewResponse, RecordData};
 use tauri::Manager;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+fn default_discovery_interval_sec() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct SettingsFile {
     receiver: artnet::ReceiverConfig,
     sender: artnet::SenderConfig,
+    #[serde(default = "default_discovery_interval_sec")]
+    discovery_interval_sec: u64,
+}
+
+impl Default for SettingsFile {
+    fn default() -> Self {
+        Self {
+            receiver: artnet::ReceiverConfig::default(),
+            sender: artnet::SenderConfig::default(),
+            discovery_interval_sec: default_discovery_interval_sec(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +112,7 @@ fn write_buffer_as_wav(path: &str, data: &RecordData) -> Result<(), String> {
     let wav = WavRecordingData {
         timestamps,
         channels,
+        dmx_channels: Some(data.channel_numbers()),
     };
     save_wav_recording(path.to_string(), sample_rate, wav)
 }
@@ -192,10 +211,18 @@ fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
 fn record_data_from_wav(data: WavRecordingData) -> RecordData {
     let channels = data.channels.len();
     let timestamps_len = data.timestamps.len();
+    let dmx_channels = data
+        .dmx_channels
+        .unwrap_or_else(|| (1..=channels as u16).collect());
     RecordData {
         timestamps: data.timestamps,
         addresses: vec![(0, 0, 0); timestamps_len],
-        channels: (0..channels).collect(),
+        channels: dmx_channels
+            .into_iter()
+            .map(|ch| ch.saturating_sub(1) as usize)
+            .filter(|ch| *ch < 512)
+            .take(channels)
+            .collect(),
         values: data.channels,
     }
 }
@@ -309,10 +336,43 @@ async fn set_channels_and_push(
 }
 
 #[tauri::command]
-fn save_settings(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+async fn send_dmx_values(
+    state: tauri::State<'_, AppState>,
+    values: Vec<u8>,
+    net: Option<u8>,
+    subnet: Option<u8>,
+    universe: Option<u8>,
+) -> Result<(), String> {
+    if values.len() != 512 {
+        return Err("Expected 512 channel values".to_string());
+    }
+    let mut data = [0u8; 512];
+    data.copy_from_slice(&values);
+    let mut cfg = state.get_sender_config();
+    if let (Some(n), Some(s), Some(u)) = (net, subnet, universe) {
+        cfg.net = n;
+        cfg.subnet = s;
+        cfg.universe = u;
+    }
+    let sock = state.udp_for_send().await.map_err(|e| e.to_string())?;
+    artnet::send_artdmx(sock.as_ref(), &cfg, &data, 0)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn save_settings(
+    app: tauri::AppHandle,
+    state: tauri::State<AppState>,
+    discovery_interval_sec: Option<u64>,
+) -> Result<(), String> {
+    if let Some(sec) = discovery_interval_sec {
+        state.set_discovery_interval_sec(sec);
+    }
     let settings = SettingsFile {
         receiver: state.get_receiver_config(),
         sender: state.get_sender_config(),
+        discovery_interval_sec: state.get_discovery_interval_sec(),
     };
     let path = settings_path(&app);
     let s = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
@@ -329,6 +389,7 @@ fn load_settings(
         if let Ok(cfg) = serde_json::from_slice::<SettingsFile>(&bytes) {
             state.set_receiver_config(cfg.receiver.clone());
             state.set_sender_config(cfg.sender.clone());
+            state.set_discovery_interval_sec(cfg.discovery_interval_sec);
             return Ok(cfg);
         }
     }
@@ -457,12 +518,24 @@ fn load_recording(state: tauri::State<AppState>, path: String) -> Result<LoadedR
 }
 
 #[tauri::command]
-async fn play_file(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+async fn play_file(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    start_ms: Option<u64>,
+    loop_playback: Option<bool>,
+) -> Result<(), String> {
     // Stop prior play
     stop_playback(state.clone());
     let cfg = state.get_sender_config();
     let handle = tokio::spawn(async move {
-        if let Err(e) = state::run_play_task(path, cfg).await {
+        if let Err(e) = state::run_play_task(
+            path,
+            cfg,
+            start_ms.unwrap_or(0),
+            loop_playback.unwrap_or(false),
+        )
+        .await
+        {
             eprintln!("playback error: {e:?}");
         }
     });
@@ -508,10 +581,17 @@ fn read_text_file(path: String) -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+fn read_binary_file(path: String) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct WavRecordingData {
     pub timestamps: Vec<u64>,
     pub channels: Vec<Vec<u8>>,
+    #[serde(default)]
+    pub dmx_channels: Option<Vec<u16>>,
 }
 
 #[tauri::command]
@@ -539,7 +619,21 @@ fn save_wav_recording(
     let sample_rate = sample_rate as u32;
     let byte_rate = sample_rate * block_align as u32;
     let data_size = (data.timestamps.len() as u32) * block_align as u32;
-    let file_size = 36 + data_size;
+    let metadata = data
+        .dmx_channels
+        .as_ref()
+        .map(|channels| {
+            serde_json::json!({ "dmx_channels": channels })
+                .to_string()
+                .into_bytes()
+        })
+        .unwrap_or_default();
+    let metadata_chunk_size = if metadata.is_empty() {
+        0
+    } else {
+        8 + metadata.len() as u32 + (metadata.len() as u32 % 2)
+    };
+    let file_size = 36 + metadata_chunk_size + data_size;
 
     // RIFF header
     file.write_all(b"RIFF").map_err(|e| e.to_string())?;
@@ -563,6 +657,16 @@ fn save_wav_recording(
         .map_err(|e| e.to_string())?;
     file.write_all(&bits_per_sample.to_le_bytes())
         .map_err(|e| e.to_string())?;
+
+    if !metadata.is_empty() {
+        file.write_all(b"anlc").map_err(|e| e.to_string())?;
+        file.write_all(&(metadata.len() as u32).to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        file.write_all(&metadata).map_err(|e| e.to_string())?;
+        if metadata.len() % 2 == 1 {
+            file.write_all(&[0]).map_err(|e| e.to_string())?;
+        }
+    }
 
     // data chunk
     file.write_all(b"data").map_err(|e| e.to_string())?;
@@ -627,6 +731,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
     // Find fmt chunk
     let mut sample_rate = 44100u32; // Default sample rate
     let mut num_channels = 0u16;
+    let mut dmx_channels: Option<Vec<u16>> = None;
     while pos < buffer.len() - 8 {
         let chunk_id = &buffer[pos..pos + 4];
         let chunk_size = u32::from_le_bytes([
@@ -673,7 +778,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             pos += chunk_size as usize;
             break;
         } else {
-            pos += chunk_size as usize;
+            pos += chunk_size as usize + (chunk_size as usize % 2);
         }
     }
 
@@ -687,8 +792,25 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             buffer[pos + 7],
         ]);
         pos += 8;
+        let chunk_end = pos.saturating_add(chunk_size as usize).min(buffer.len());
 
-        if chunk_id == b"data" {
+        if chunk_id == b"anlc" {
+            if let Ok(text) = std::str::from_utf8(&buffer[pos..chunk_end]) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+                    dmx_channels =
+                        value
+                            .get("dmx_channels")
+                            .and_then(|v| v.as_array())
+                            .map(|channels| {
+                                channels
+                                    .iter()
+                                    .filter_map(|ch| ch.as_u64().map(|n| n as u16))
+                                    .collect()
+                            });
+                }
+            }
+            pos = chunk_end + (chunk_size as usize % 2);
+        } else if chunk_id == b"data" {
             // Read sample data
             let num_frames = chunk_size as usize / num_channels as usize;
             let mut timestamps = Vec::new();
@@ -711,9 +833,10 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             return Ok(WavRecordingData {
                 timestamps,
                 channels,
+                dmx_channels,
             });
         } else {
-            pos += chunk_size as usize;
+            pos = chunk_end + (chunk_size as usize % 2);
         }
     }
 
@@ -721,7 +844,12 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
 }
 
 #[tauri::command]
-async fn play_wav_file(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
+async fn play_wav_file(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    start_ms: Option<u64>,
+    loop_playback: Option<bool>,
+) -> Result<(), String> {
     // Stop prior play
     stop_playback(state.clone());
 
@@ -730,7 +858,14 @@ async fn play_wav_file(state: tauri::State<'_, AppState>, path: String) -> Resul
     let cfg = state.get_sender_config();
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = state::run_wav_play_task(wav_data, cfg).await {
+        if let Err(e) = state::run_wav_play_task(
+            wav_data,
+            cfg,
+            start_ms.unwrap_or(0),
+            loop_playback.unwrap_or(false),
+        )
+        .await
+        {
             eprintln!("WAV playback error: {e:?}");
         }
     });
@@ -806,6 +941,38 @@ fn stop_animation(state: tauri::State<AppState>) {
     state.stop_animation();
 }
 
+#[tauri::command]
+async fn artnet_discover(
+    state: tauri::State<'_, AppState>,
+    cfg: artnet::SenderConfig,
+    extra_broadcast_ips: Option<Vec<String>>,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<discovery::ArtNetDiscoveredNode>, String> {
+    let port = cfg.port;
+    let timeout_ms = timeout_ms.unwrap_or(2000);
+    let mut broadcast_hosts = discovery::subnet_broadcast_addrs();
+    let t = cfg.target_ip.trim();
+    if !t.is_empty() {
+        broadcast_hosts.push(cfg.target_ip.clone());
+    }
+    broadcast_hosts.push("255.255.255.255".into());
+    if let Some(extra) = extra_broadcast_ips {
+        broadcast_hosts.extend(extra);
+    }
+    broadcast_hosts.retain(|s| !s.trim().is_empty());
+    let mut uniq = HashSet::new();
+    broadcast_hosts.retain(|s| uniq.insert(s.clone()));
+
+    let (tx, rx) = mpsc::channel(256);
+    let mut relay_slot = Some(rx);
+    state.set_discovery_poll_reply_tx(Some(tx)).await;
+    let out = discovery::scan_artnet(&broadcast_hosts, port, timeout_ms, &mut relay_slot)
+        .await
+        .map_err(|e| e.to_string());
+    state.set_discovery_poll_reply_tx(None).await;
+    out
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -819,6 +986,7 @@ fn main() {
                     let state: tauri::State<AppState> = app.state();
                     state.set_receiver_config(cfg.receiver);
                     state.set_sender_config(cfg.sender);
+                    state.set_discovery_interval_sec(cfg.discovery_interval_sec);
                 }
             }
             // Auto-start receiver on app launch (run inline to avoid 'static issues)
@@ -842,6 +1010,7 @@ fn main() {
             set_channel,
             set_channels,
             set_channels_and_push,
+            send_dmx_values,
             save_settings,
             load_settings,
             start_recording,
@@ -859,12 +1028,14 @@ fn main() {
             set_event_filter,
             write_text_file,
             read_text_file,
+            read_binary_file,
             patch_animation_params,
             start_animation,
             stop_animation,
             save_wav_recording,
             load_wav_recording,
-            play_wav_file
+            play_wav_file,
+            artnet_discover
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

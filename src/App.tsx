@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { DiscoveredNode } from "./artdiscover";
 import "./App.css";
 import MonitorCanvas from "./components/MonitorCanvas";
 import SenderTab from "./components/SenderTab";
 import RecordPlayTab from "./components/RecordPlayTab";
+import DiscoverTab from "./components/DiscoverTab";
 
 function App() {
-  const [tab, setTab] = useState<"monitor" | "sender" | "recplay">("monitor");
+  const [tab, setTab] = useState<
+    "monitor" | "sender" | "recplay" | "discover"
+  >("monitor");
   const [faders, setFaders] = useState<number[]>(Array(512).fill(0));
   // path handled within RecordPlayTab now
   const [masterValue, setMasterValue] = useState(255);
@@ -25,17 +29,67 @@ function App() {
     universe: 0,
   });
 
+  const [discoveryIntervalSec, setDiscoveryIntervalSec] = useState(10);
+  const [discoveredNodes, setDiscoveredNodes] = useState<DiscoveredNode[]>([]);
+  const [discoveryScanning, setDiscoveryScanning] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const discoveryInFlightRef = useRef(false);
+
   // Load settings once
   useEffect(() => {
     invoke("load_settings")
       .then((s: any) => {
         if (s?.receiver) setMonCfg(s.receiver);
         if (s?.sender) setSndCfg(s.sender);
+        const di = Number(s?.discovery_interval_sec);
+        if (Number.isFinite(di)) {
+          const v = Math.max(0, Math.min(86400, Math.round(di)));
+          setDiscoveryIntervalSec(v);
+        }
       })
       .catch((e) => {
         console.error("Failed to load settings:", e);
       });
   }, []);
+
+  const performDiscovery = useCallback(
+    async (extraBroadcastIps?: string[], timeoutMs = 2000) => {
+      if (discoveryInFlightRef.current) return;
+      discoveryInFlightRef.current = true;
+      setDiscoveryScanning(true);
+      setDiscoveryError(null);
+      try {
+        const list = await invoke<DiscoveredNode[]>("artnet_discover", {
+          cfg: {
+            target_ip: sndCfg.target_ip,
+            port: sndCfg.port,
+            net: sndCfg.net,
+            subnet: sndCfg.subnet,
+            universe: sndCfg.universe,
+            fps: sndCfg.fps,
+          },
+          extraBroadcastIps:
+            extraBroadcastIps?.length ? extraBroadcastIps : null,
+          timeoutMs,
+        });
+        setDiscoveredNodes(list);
+      } catch (e) {
+        setDiscoveryError(String(e));
+      } finally {
+        discoveryInFlightRef.current = false;
+        setDiscoveryScanning(false);
+      }
+    },
+    [sndCfg]
+  );
+
+  useEffect(() => {
+    if (discoveryIntervalSec <= 0) return undefined;
+    const run = () => void performDiscovery();
+    const id = window.setInterval(run, discoveryIntervalSec * 1000);
+    run();
+    return () => window.clearInterval(id);
+  }, [discoveryIntervalSec, performDiscovery]);
 
   // Auto-start monitor on app open (backend also autostarts; this ensures it runs even if settings aren't loaded yet)
   useEffect(() => {
@@ -93,13 +147,13 @@ function App() {
       fadersRef.current = n;
       return n;
     });
-    if (!nextSnapshot) {
+    if (nextSnapshot === null) {
       return Promise.resolve();
     }
     if (sendDebounceRef.current != null) {
       window.clearTimeout(sendDebounceRef.current);
     }
-    const snapshotToSend = nextSnapshot;
+    const snapshotToSend: number[] = nextSnapshot;
     sendDebounceRef.current = window.setTimeout(() => {
       sendDebounceRef.current = null;
       const m = masterRef.current;
@@ -136,11 +190,37 @@ function App() {
 
   // Settings save
   const saveSettings = async () => {
-    await invoke("save_settings");
+    await invoke("save_settings", {
+      discovery_interval_sec: discoveryIntervalSec,
+    });
   };
 
   // Record/Play
   // Record/Play controls now handled in RecordPlayTab
+
+  const discoveryPicker =
+    discoveredNodes.length > 0 ? (
+      <div className="discovered-picker">
+        <div className="discovered-picker-title">Detected Art-Net nodes</div>
+        <ul className="discovered-picker-list">
+          {discoveredNodes.map((r) => (
+            <li key={`${r.ip}-${r.mac}`}>
+              <span title={r.longName}>{r.shortName || r.longName || r.ip}</span>
+              <span className="mono discovered-picker-ip">{r.ip}</span>
+              <button
+                type="button"
+                className="btn btn-small"
+                onClick={() =>
+                  setSndCfg((prev) => ({ ...prev, target_ip: r.ip }))
+                }
+              >
+                Sender target
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    ) : null;
 
   const contentScrollRef = useRef<HTMLElement | null>(null);
 
@@ -166,6 +246,12 @@ function App() {
             onClick={() => setTab("recplay")}
           >
             Record/Play
+          </button>
+          <button
+            className={`tab ${tab === "discover" ? "active" : ""}`}
+            onClick={() => setTab("discover")}
+          >
+            Discover
           </button>
         </nav>
         <div className="spacer" />
@@ -213,9 +299,21 @@ function App() {
           />
         </section>
 
-        {/* Record/Play */}
         <section className={`view ${tab === "recplay" ? "active" : ""}`}>
           <RecordPlayTab />
+        </section>
+
+        <section className={`view ${tab === "discover" ? "active" : ""}`}>
+          <DiscoverTab
+            onApplyTargetIp={(ip) =>
+              setSndCfg((prev) => ({ ...prev, target_ip: ip }))
+            }
+            discoveryIntervalSec={discoveryIntervalSec}
+            rows={discoveredNodes}
+            scanning={discoveryScanning}
+            error={discoveryError}
+            onScan={(extras, tm) => void performDiscovery(extras, tm)}
+          />
         </section>
       </main>
 
@@ -247,6 +345,28 @@ function App() {
               }
             />
           </div>
+          <div className="row">
+            <label>Discovery interval (sec)</label>
+            <input
+              type="number"
+              min={0}
+              max={86400}
+              value={discoveryIntervalSec}
+              onChange={(e) => {
+                const n = Number(e.currentTarget.value);
+                const v =
+                  Number.isFinite(n)
+                    ? Math.max(0, Math.min(86400, Math.round(n)))
+                    : 10;
+                setDiscoveryIntervalSec(v);
+              }}
+            />
+          </div>
+          <p className="field-hint">
+            0 turns off periodic ArtPoll scans. Uses current sender broadcast
+            list; requires receiver on Art-Net UDP.
+          </p>
+          {discoveryPicker}
           <div className="actions">
             <button
               className="btn"
@@ -344,6 +464,28 @@ function App() {
               }
             />
           </div>
+          <div className="row">
+            <label>Discovery interval (sec)</label>
+            <input
+              type="number"
+              min={0}
+              max={86400}
+              value={discoveryIntervalSec}
+              onChange={(e) => {
+                const n = Number(e.currentTarget.value);
+                const v =
+                  Number.isFinite(n)
+                    ? Math.max(0, Math.min(86400, Math.round(n)))
+                    : 10;
+                setDiscoveryIntervalSec(v);
+              }}
+            />
+          </div>
+          <p className="field-hint">
+            0 disables auto-discovery (default 10). Same value saved with
+            settings.
+          </p>
+          {discoveryPicker}
           <div className="actions">
             <button
               className="btn"

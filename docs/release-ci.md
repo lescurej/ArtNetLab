@@ -22,6 +22,7 @@ Optional (if you plan to sign Windows builds)
 
 Notes
 - The workflow uses `tauri-apps/tauri-action` to build and publish artifacts.
+- The tag version is injected into `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` before bundling.
 - macOS signing identity should match `bundle.macOS.signingIdentity` in `src-tauri/tauri.conf.json`.
 - Linux uses system dependencies like `libwebkit2gtk-4.1-dev`; the workflow installs them on Ubuntu.
 - Windows uses WiX Toolset for MSI packaging; the workflow installs it via Chocolatey.

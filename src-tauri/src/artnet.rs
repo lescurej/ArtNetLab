@@ -86,12 +86,7 @@ fn compute_dmx_length(data: &[u8; 512]) -> u16 {
     }
 }
 
-pub fn encode_artdmx_into(
-    pkt: &mut Vec<u8>,
-    cfg: &SenderConfig,
-    data: &[u8; 512],
-    sequence: u8,
-) {
+pub fn encode_artdmx_into(pkt: &mut Vec<u8>, cfg: &SenderConfig, data: &[u8; 512], sequence: u8) {
     let length = compute_dmx_length(data);
     pkt.clear();
     pkt.reserve(18 + length as usize);

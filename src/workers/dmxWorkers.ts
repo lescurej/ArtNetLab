@@ -2,7 +2,7 @@
 const DMX_CHANNELS = 512;
 const DMX_MAX_VALUE = 255;
 
-type AnimationMode = "sinusoid" | "ramp" | "square" | "off";
+type AnimationMode = "sinusoid" | "ramp" | "square" | "noise" | "off";
 
 interface AnimationMessage {
   type: "start" | "stop" | "update";
@@ -35,6 +35,9 @@ function generateAnimationValues(
       break;
     case "square":
       value = Math.sin(2 * Math.PI * t) > 0 ? 1 : 0;
+      break;
+    case "noise":
+      value = Math.random();
       break;
     default:
       value = 0;

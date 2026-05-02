@@ -14,6 +14,7 @@ interface SliderProps {
   thumbSize?: number; // px
   className?: string;
   ariaLabel?: string;
+  disabled?: boolean;
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -37,8 +38,12 @@ export default function Slider({
   thumbSize = 20,
   className = "",
   ariaLabel,
+  disabled = false,
 }: SliderProps) {
   const rootRef = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
+  const dragMovedRef = useRef(false);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
 
   const ratio = useMemo(() => {
     const r = (value - min) / (max - min || 1);
@@ -78,11 +83,15 @@ export default function Slider({
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      if (disabled) return;
+      draggingRef.current = true;
+      dragMovedRef.current = false;
+      dragStartRef.current = { x: e.clientX, y: e.clientY };
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
       const r = coordsFromPointer(e.clientX, e.clientY);
       commitRatio(r);
     },
-    [coordsFromPointer, commitRatio]
+    [coordsFromPointer, commitRatio, disabled]
   );
 
   // Throttle move handling to animation frames for smoother updates
@@ -98,17 +107,25 @@ export default function Slider({
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      if (disabled) return;
+      if (!draggingRef.current) return;
       if (e.buttons === 0) return; // only when dragging
+      if (dragStartRef.current) {
+        const dx = Math.abs(e.clientX - dragStartRef.current.x);
+        const dy = Math.abs(e.clientY - dragStartRef.current.y);
+        if (dx > 2 || dy > 2) dragMovedRef.current = true;
+      }
       lastXY.current = { x: e.clientX, y: e.clientY };
       if (rafRef.current == null) {
         rafRef.current = requestAnimationFrame(pump);
       }
     },
-    [pump]
+    [pump, disabled]
   );
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLDivElement>) => {
+      if (disabled) return;
       let delta = 0;
       switch (e.key) {
         case "ArrowUp":
@@ -139,7 +156,7 @@ export default function Slider({
       e.preventDefault();
       onChange(clamp(roundToStep(value + delta, step, min), min, max));
     },
-    [value, step, min, max, onChange]
+    [value, step, min, max, onChange, disabled]
   );
 
   // Layout variables for CSS
@@ -181,6 +198,22 @@ export default function Slider({
       tabIndex={0}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
+      onClick={(e) => {
+        if (dragMovedRef.current) {
+          e.preventDefault();
+          e.stopPropagation();
+          dragMovedRef.current = false;
+        }
+      }}
+      onPointerUp={() => {
+        draggingRef.current = false;
+      }}
+      onPointerCancel={() => {
+        draggingRef.current = false;
+      }}
+      onLostPointerCapture={() => {
+        draggingRef.current = false;
+      }}
       onKeyDown={onKeyDown}
     >
       <div className="osl-track" />

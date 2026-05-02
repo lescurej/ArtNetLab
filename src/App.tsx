@@ -11,10 +11,6 @@ function App() {
   // path handled within RecordPlayTab now
   const [masterValue, setMasterValue] = useState(255);
   const [senderRunning, setSenderRunning] = useState(false);
-  const senderRunningRef = useRef(false);
-  useEffect(() => {
-    senderRunningRef.current = senderRunning;
-  }, [senderRunning]);
 
   // SETTINGS state
   const [showMon, setShowMon] = useState(false);
@@ -65,10 +61,6 @@ function App() {
       setSenderRunning(true);
     }
   };
-  const sendNow = async () => {
-    if (!senderRunningRef.current) return;
-    await invoke("push_frame");
-  };
   const all = async (v: number) => {
     const arr = new Array(512).fill(v);
     setFaders(arr);
@@ -77,8 +69,7 @@ function App() {
     const scaledArr = arr.map((value) =>
       Math.round((value * masterValue) / 255)
     );
-    await invoke("set_channels", { values: scaledArr });
-    await sendNow();
+    await invoke("set_channels_and_push", { values: scaledArr });
   };
 
   // Update single fader, batch backend update + send
@@ -93,23 +84,27 @@ function App() {
   }, [masterValue]);
 
   const onFader = useCallback((i: number, v: number) => {
+    let nextSnapshot: number[] | null = null;
     setFaders((prev) => {
       if (prev[i] === v) return prev;
       const n = prev.slice();
       n[i] = v;
+      nextSnapshot = n;
+      fadersRef.current = n;
       return n;
     });
+    if (!nextSnapshot) {
+      return Promise.resolve();
+    }
     if (sendDebounceRef.current != null) {
       window.clearTimeout(sendDebounceRef.current);
     }
+    const snapshotToSend = nextSnapshot;
     sendDebounceRef.current = window.setTimeout(() => {
       sendDebounceRef.current = null;
-      const src = fadersRef.current;
       const m = masterRef.current;
-      const scaled = src.map((val) => Math.round((val * m) / 255));
-      invoke("set_channels", { values: scaled }).catch(() => {});
-      if (senderRunningRef.current)
-        invoke("push_frame").catch(() => {});
+      const scaled = snapshotToSend.map((val) => Math.round((val * m) / 255));
+      invoke("set_channels_and_push", { values: scaled }).catch(() => {});
     }, 30);
     return Promise.resolve();
   }, []);
@@ -125,8 +120,7 @@ function App() {
     fadersRef.current = base;
     setFaders(base);
     const scaled = base.map((val) => Math.round((val * m) / 255));
-    invoke("set_channels", { values: scaled }).catch(() => {});
-    if (senderRunningRef.current) invoke("push_frame").catch(() => {});
+    invoke("set_channels_and_push", { values: scaled }).catch(() => {});
   }, []);
 
   const onInputChange = (i: number, value: string) => {

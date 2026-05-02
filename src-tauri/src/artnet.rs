@@ -86,9 +86,15 @@ fn compute_dmx_length(data: &[u8; 512]) -> u16 {
     }
 }
 
-pub fn encode_artdmx(cfg: &SenderConfig, data: &[u8; 512], sequence: u8) -> Vec<u8> {
+pub fn encode_artdmx_into(
+    pkt: &mut Vec<u8>,
+    cfg: &SenderConfig,
+    data: &[u8; 512],
+    sequence: u8,
+) {
     let length = compute_dmx_length(data);
-    let mut pkt = Vec::with_capacity(18 + length as usize);
+    pkt.clear();
+    pkt.reserve(18 + length as usize);
     pkt.extend_from_slice(ARTNET_ID);
     pkt.extend_from_slice(&OP_OUTPUT.to_le_bytes());
     pkt.extend_from_slice(&PROT_VER.to_be_bytes());
@@ -101,6 +107,11 @@ pub fn encode_artdmx(cfg: &SenderConfig, data: &[u8; 512], sequence: u8) -> Vec<
     pkt.push(cfg.net & 0x7f); // Net (hi)
     pkt.extend_from_slice(&length.to_be_bytes()); // Length hi, lo (big-endian)
     pkt.extend_from_slice(&data[..length as usize]);
+}
+
+pub fn encode_artdmx(cfg: &SenderConfig, data: &[u8; 512], sequence: u8) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(530);
+    encode_artdmx_into(&mut pkt, cfg, data, sequence);
     pkt
 }
 
@@ -194,5 +205,18 @@ pub async fn send_artdmx(
     let pkt = encode_artdmx(cfg, data, sequence);
     let target: SocketAddr = format!("{}:{}", cfg.target_ip, cfg.port).parse()?;
     sock.send_to(&pkt, target).await?;
+    Ok(())
+}
+
+pub async fn send_artdmx_with_buffer(
+    sock: &UdpSocket,
+    cfg: &SenderConfig,
+    data: &[u8; 512],
+    sequence: u8,
+    pkt: &mut Vec<u8>,
+) -> Result<()> {
+    encode_artdmx_into(pkt, cfg, data, sequence);
+    let target: SocketAddr = format!("{}:{}", cfg.target_ip, cfg.port).parse()?;
+    sock.send_to(pkt, target).await?;
     Ok(())
 }

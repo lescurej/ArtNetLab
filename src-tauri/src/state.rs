@@ -22,6 +22,18 @@ pub enum AnimKind {
     Ramp,
     Square,
     Chaser,
+    Noise,
+}
+
+pub fn anim_kind_from_code(code: u8) -> AnimKind {
+    match code {
+        1 => AnimKind::Sinusoid,
+        2 => AnimKind::Ramp,
+        3 => AnimKind::Square,
+        4 => AnimKind::Chaser,
+        5 => AnimKind::Noise,
+        _ => AnimKind::Off,
+    }
 }
 
 pub fn anim_kind_from_cmd(s: &str) -> AnimKind {
@@ -30,6 +42,7 @@ pub fn anim_kind_from_cmd(s: &str) -> AnimKind {
         "ramp" => AnimKind::Ramp,
         "square" => AnimKind::Square,
         "chaser" => AnimKind::Chaser,
+        "noise" => AnimKind::Noise,
         _ => AnimKind::Off,
     }
 }
@@ -42,6 +55,8 @@ pub struct AnimationState {
     pub is_running: bool,
     pub chaser_from: u16,
     pub chaser_to: u16,
+    pub animation_targets: [bool; 512],
+    pub animation_modes: [AnimKind; 512],
 }
 
 impl Default for AnimationState {
@@ -53,6 +68,8 @@ impl Default for AnimationState {
             is_running: false,
             chaser_from: 1,
             chaser_to: 512,
+            animation_targets: [true; 512],
+            animation_modes: [AnimKind::Off; 512],
         }
     }
 }
@@ -64,6 +81,43 @@ pub fn sanitize_chaser_ends(mut a: u16, mut b: u16) -> (u16, u16) {
         std::mem::swap(&mut a, &mut b);
     }
     (a, b)
+}
+
+pub fn sanitize_animation_targets(channels: Option<Vec<u16>>) -> [bool; 512] {
+    let mut targets = [false; 512];
+    if let Some(list) = channels {
+        for ch in list {
+            let idx = ch.saturating_sub(1) as usize;
+            if idx < 512 {
+                targets[idx] = true;
+            }
+        }
+    }
+    if targets.iter().any(|&x| x) {
+        targets
+    } else {
+        [true; 512]
+    }
+}
+
+pub fn sanitize_animation_modes(
+    modes: Option<Vec<u8>>,
+    fallback_mode: AnimKind,
+    targets: [bool; 512],
+) -> [AnimKind; 512] {
+    let mut out = [AnimKind::Off; 512];
+    if let Some(list) = modes {
+        for (idx, code) in list.into_iter().take(512).enumerate() {
+            out[idx] = anim_kind_from_code(code);
+        }
+        return out;
+    }
+    for idx in 0..512 {
+        if targets[idx] {
+            out[idx] = fallback_mode;
+        }
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -259,9 +313,11 @@ impl RecordBuffer {
 }
 
 fn normalize_channels(channels: Vec<usize>) -> Vec<usize> {
-    let mut result = Vec::new();
+    let mut seen = [false; 512];
+    let mut result = Vec::with_capacity(channels.len().min(512));
     for ch in channels {
-        if ch < 512 && !result.contains(&ch) {
+        if ch < 512 && !seen[ch] {
+            seen[ch] = true;
             result.push(ch);
         }
     }
@@ -351,6 +407,10 @@ impl AppState {
     }
     pub fn set_sender_config(&self, cfg: SenderConfig) {
         self.inner.lock().unwrap().send_cfg = cfg;
+    }
+
+    pub fn snapshot_channels(&self) -> [u8; 512] {
+        self.inner.lock().unwrap().channels
     }
 
     pub fn set_channel(&self, index: usize, value: u8) {
@@ -492,15 +552,19 @@ impl AppState {
         master_value: u8,
         chaser_from: Option<u16>,
         chaser_to: Option<u16>,
+        channels: Option<Vec<u16>>,
+        modes: Option<Vec<u8>>,
     ) {
         let mut g = self.inner.lock().unwrap();
         let a = &mut g.animation_state;
-        if !a.is_running || a.mode == AnimKind::Off {
+        if !a.is_running {
             return;
         }
         a.frequency = frequency.abs().max(1e-3);
         a.master_value = master_value;
-        if a.mode == AnimKind::Chaser {
+        a.animation_targets = sanitize_animation_targets(channels);
+        a.animation_modes = sanitize_animation_modes(modes, a.mode, a.animation_targets);
+        if a.animation_modes.iter().any(|m| *m == AnimKind::Chaser) {
             if let (Some(cf), Some(ct)) = (chaser_from, chaser_to) {
                 let (f, t) = sanitize_chaser_ends(cf, ct);
                 a.chaser_from = f;
@@ -515,52 +579,94 @@ fn dmx_apply_master(value: u8, master: u8) -> u8 {
     ((value as u16 * master as u16) / 255) as u8
 }
 
-fn generate_animation_scaled_frame(time_ms: u64, animation: AnimationState) -> [u8; 512] {
-    let mut values = [0u8; 512];
-    if animation.mode == AnimKind::Off {
+#[inline(always)]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
+    x ^ (x >> 31)
+}
+
+#[inline(always)]
+fn noise_unit(channel: usize, step: u64) -> f64 {
+    let seed = ((channel as u64 + 1) << 32) ^ step;
+    let n = splitmix64(seed);
+    (n as f64) / (u64::MAX as f64)
+}
+
+#[inline(always)]
+fn animation_has_active_modes(animation: &AnimationState) -> bool {
+    animation
+        .animation_modes
+        .iter()
+        .any(|mode| *mode != AnimKind::Off)
+}
+
+fn generate_animation_scaled_frame(
+    time_ms: u64,
+    animation: AnimationState,
+    mut values: [u8; 512],
+) -> [u8; 512] {
+    if !animation_has_active_modes(&animation) {
         return values;
     }
     let fq = animation.frequency.abs().max(1e-3);
     let period_ms = (1000.0 / fq).max(1.0) as u64;
     let m = animation.master_value;
+    let t_frac = ((time_ms % period_ms) as f64 / period_ms as f64).clamp(0.0, 1.0);
+    let sinusoid_v = {
+        let shape = ((2.0 * std::f64::consts::PI * t_frac).sin() + 1.0) / 2.0;
+        (shape * 255.0).round().clamp(0.0, 255.0) as u8
+    };
+    let ramp_v = (t_frac * 255.0).round().clamp(0.0, 255.0) as u8;
+    let square_v = if (2.0 * std::f64::consts::PI * t_frac).sin() > 0.0 {
+        255
+    } else {
+        0
+    };
+    let period_non_zero = period_ms.max(1);
+    let step = time_ms / period_non_zero;
+    let frac = ((time_ms % period_non_zero) as f64 / period_non_zero as f64).clamp(0.0, 1.0);
+    let mut chaser_targets: Vec<usize> = Vec::new();
 
-    match animation.mode {
-        AnimKind::Chaser => {
-            let (dm_lo, dm_hi) =
-                sanitize_chaser_ends(animation.chaser_from, animation.chaser_to);
-            let lo = (dm_lo as usize).saturating_sub(1).min(511);
-            let hi = (dm_hi as usize).saturating_sub(1).min(511);
-            let span = hi.saturating_sub(lo).saturating_add(1).max(1);
-            let dwell_ms = period_ms.max(1);
-            let cycle_ms = dwell_ms.saturating_mul(span as u64).max(1);
-            let phase = time_ms % cycle_ms;
-            let idx = (phase / dwell_ms).min(span as u64 - 1) as usize;
-            values[lo + idx] = dmx_apply_master(255, m);
+    for idx in 0..512 {
+        if !animation.animation_targets[idx] {
+            continue;
         }
-        AnimKind::Sinusoid => {
-            let t_frac = ((time_ms % period_ms) as f64 / period_ms as f64).clamp(0.0, 1.0);
-            let shape = ((2.0 * std::f64::consts::PI * t_frac).sin() + 1.0) / 2.0;
-            let v = (shape * 255.0).round().clamp(0.0, 255.0) as u8;
-            let s = dmx_apply_master(v, m);
-            values.fill(s);
+        match animation.animation_modes[idx] {
+            AnimKind::Off => {}
+            AnimKind::Sinusoid => {
+                values[idx] = dmx_apply_master(sinusoid_v, m);
+            }
+            AnimKind::Ramp => {
+                values[idx] = dmx_apply_master(ramp_v, m);
+            }
+            AnimKind::Square => {
+                values[idx] = dmx_apply_master(square_v, m);
+            }
+            AnimKind::Noise => {
+                let a = noise_unit(idx, step);
+                let b = noise_unit(idx, step + 1);
+                let v = ((a + (b - a) * frac) * 255.0).round().clamp(0.0, 255.0) as u8;
+                values[idx] = dmx_apply_master(v, m);
+            }
+            AnimKind::Chaser => {
+                chaser_targets.push(idx);
+            }
         }
-        AnimKind::Ramp => {
-            let t_frac = ((time_ms % period_ms) as f64 / period_ms as f64).clamp(0.0, 1.0);
-            let v = (t_frac * 255.0).round().clamp(0.0, 255.0) as u8;
-            let s = dmx_apply_master(v, m);
-            values.fill(s);
+    }
+
+    if !chaser_targets.is_empty() {
+        for idx in &chaser_targets {
+            values[*idx] = 0;
         }
-        AnimKind::Square => {
-            let t_frac = ((time_ms % period_ms) as f64 / period_ms as f64).clamp(0.0, 1.0);
-            let v = if (2.0 * std::f64::consts::PI * t_frac).sin() > 0.0 {
-                255
-            } else {
-                0
-            };
-            let s = dmx_apply_master(v, m);
-            values.fill(s);
-        }
-        AnimKind::Off => {}
+        let span = chaser_targets.len().max(1);
+        let dwell_ms = period_non_zero;
+        let cycle_ms = dwell_ms.saturating_mul(span as u64).max(1);
+        let phase = time_ms % cycle_ms;
+        let idx = (phase / dwell_ms).min(span as u64 - 1) as usize;
+        let target_idx = chaser_targets[idx];
+        values[target_idx] = dmx_apply_master(255, m);
     }
 
     values
@@ -581,13 +687,14 @@ pub async fn run_animation_task(app_state: AppState, app: AppHandle) -> Result<(
             inner.animation_state
         };
 
-        if !animation.is_running || animation.mode == AnimKind::Off {
+        if !animation.is_running || !animation_has_active_modes(&animation) {
             prev_frame = None;
             continue;
         }
 
         let time_ms = t0.elapsed().as_millis() as u64;
-        let frame = generate_animation_scaled_frame(time_ms, animation);
+        let base = app_state.snapshot_channels();
+        let frame = generate_animation_scaled_frame(time_ms, animation, base);
         if prev_frame.as_ref() == Some(&frame) {
             continue;
         }
@@ -642,6 +749,7 @@ pub async fn run_receiver_task(
 
 pub async fn run_sender_task(cfg: SenderConfig, app_state: AppState) -> Result<()> {
     let sock = app_state.udp_for_send().await?;
+    let mut pkt = Vec::with_capacity(530);
     let mut interval = tokio::time::interval(Duration::from_millis(
         ((1000.0f32 / cfg.fps.max(1) as f32).round() as u64).max(1),
     ));
@@ -649,7 +757,7 @@ pub async fn run_sender_task(cfg: SenderConfig, app_state: AppState) -> Result<(
     loop {
         interval.tick().await;
         let (last, seq) = app_state.snapshot_channels_tick_seq();
-        let _ = artnet::send_artdmx(sock.as_ref(), &cfg, &last, seq).await;
+        let _ = artnet::send_artdmx_with_buffer(sock.as_ref(), &cfg, &last, seq, &mut pkt).await;
     }
 }
 

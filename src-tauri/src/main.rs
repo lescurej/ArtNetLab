@@ -98,31 +98,54 @@ fn write_buffer_as_wav(path: &str, data: &RecordData) -> Result<(), String> {
     save_wav_recording(path.to_string(), sample_rate, wav)
 }
 
+#[derive(Deserialize, Default)]
+struct JsonlHeader {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    channels: Vec<u16>,
+    #[serde(default)]
+    channel: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct JsonlRecord {
+    t_ms: u64,
+    #[serde(default)]
+    net: u8,
+    #[serde(default)]
+    subnet: u8,
+    #[serde(default)]
+    universe: u8,
+    values: Vec<u8>,
+}
+
 fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut timestamps = Vec::new();
     let mut addresses = Vec::new();
     let mut channels: Vec<usize> = (0..512).collect();
     let mut values: Vec<Vec<u8>> = Vec::new();
-    let mut first_line = true;
+    let mut first_payload_line = true;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
+    for raw in content.lines() {
+        let trimmed = raw.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if first_line {
-            first_line = false;
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if val.get("format").is_some() {
-                    if let Some(arr) = val.get("channels").and_then(|v| v.as_array()) {
-                        channels = arr
-                            .iter()
-                            .filter_map(|n| n.as_u64())
+
+        if first_payload_line {
+            first_payload_line = false;
+            if let Ok(header) = serde_json::from_str::<JsonlHeader>(trimmed) {
+                if header.format.is_some() {
+                    if !header.channels.is_empty() {
+                        channels = header
+                            .channels
+                            .into_iter()
                             .map(|n| n.saturating_sub(1) as usize)
                             .filter(|n| *n < 512)
                             .collect();
-                    } else if let Some(ch) = val.get("channel").and_then(|v| v.as_u64()) {
+                    } else if let Some(ch) = header.channel {
                         let idx = ch.saturating_sub(1) as usize;
                         if idx < 512 {
                             channels = vec![idx];
@@ -138,36 +161,22 @@ fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
             values = channels.iter().map(|_| Vec::new()).collect();
         }
 
-        let rec: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| e.to_string())?;
-        let t_ms = rec
-            .get("t_ms")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| "Missing t_ms field".to_string())?;
-        let net = rec.get("net").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-        let subnet = rec.get("subnet").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-        let universe = rec.get("universe").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-        let vals = rec
-            .get("values")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| "Missing values field".to_string())?;
-        timestamps.push(t_ms);
-        addresses.push((net, subnet, universe));
+        let rec: JsonlRecord = serde_json::from_str(trimmed).map_err(|e| e.to_string())?;
+        timestamps.push(rec.t_ms);
+        addresses.push((rec.net, rec.subnet, rec.universe));
         if values.len() < channels.len() {
             values.resize_with(channels.len(), Vec::new);
         }
-        for (idx, _ch) in channels.iter().enumerate() {
-            let val = vals
-                .get(idx)
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u8)
-                .unwrap_or(0);
-            values[idx].push(val);
+        for (idx, _) in channels.iter().enumerate() {
+            values[idx].push(rec.values.get(idx).copied().unwrap_or(0));
         }
     }
 
     let mut normalized = Vec::new();
+    let mut seen = [false; 512];
     for ch in channels {
-        if ch < 512 && !normalized.contains(&ch) {
+        if ch < 512 && !seen[ch] {
+            seen[ch] = true;
             normalized.push(ch);
         }
     }
@@ -277,6 +286,26 @@ fn set_channels(state: tauri::State<AppState>, values: Vec<u8>) {
     if values.len() == 512 {
         state.set_channels(&values);
     }
+}
+
+#[tauri::command]
+async fn set_channels_and_push(
+    state: tauri::State<'_, AppState>,
+    values: Vec<u8>,
+) -> Result<(), String> {
+    if values.len() != 512 {
+        return Err("Expected 512 channel values".to_string());
+    }
+    state.set_channels(&values);
+    if !state.sender_stream_active() {
+        return Ok(());
+    }
+    let cfg = state.get_sender_config();
+    let sock = state.udp_for_send().await.map_err(|e| e.to_string())?;
+    let (data, seq) = state.snapshot_channels_tick_seq();
+    artnet::send_artdmx(sock.as_ref(), &cfg, &data, seq)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -718,6 +747,8 @@ async fn start_animation(
     master_value: u8,
     chaser_from: Option<u16>,
     chaser_to: Option<u16>,
+    channels: Option<Vec<u16>>,
+    modes: Option<Vec<u8>>,
 ) -> Result<(), String> {
     state.stop_animation();
     let fq = if frequency.is_finite() {
@@ -727,6 +758,8 @@ async fn start_animation(
     };
     let kind = state::anim_kind_from_cmd(&mode);
     let (cf, ct) = state::sanitize_chaser_ends(chaser_from.unwrap_or(1), chaser_to.unwrap_or(512));
+    let targets = state::sanitize_animation_targets(channels);
+    let animation_modes = state::sanitize_animation_modes(modes, kind, targets);
     state.set_animation_state(state::AnimationState {
         mode: kind,
         frequency: fq,
@@ -734,6 +767,8 @@ async fn start_animation(
         is_running: true,
         chaser_from: cf,
         chaser_to: ct,
+        animation_targets: targets,
+        animation_modes,
     });
 
     let app_state = state.inner().clone();
@@ -755,13 +790,15 @@ fn patch_animation_params(
     master_value: u8,
     chaser_from: Option<u16>,
     chaser_to: Option<u16>,
+    channels: Option<Vec<u16>>,
+    modes: Option<Vec<u8>>,
 ) {
     let fq = if frequency.is_finite() {
         frequency.abs().max(1e-3)
     } else {
         1.0
     };
-    state.patch_animation_live(fq, master_value, chaser_from, chaser_to);
+    state.patch_animation_live(fq, master_value, chaser_from, chaser_to, channels, modes);
 }
 
 #[tauri::command]
@@ -804,6 +841,7 @@ fn main() {
             push_frame,
             set_channel,
             set_channels,
+            set_channels_and_push,
             save_settings,
             load_settings,
             start_recording,

@@ -59,37 +59,10 @@ pub struct DmxFrame {
     pub values: Vec<u8>, // length elements
 }
 
-fn compute_dmx_length(data: &[u8; 512]) -> u16 {
-    // Per Art-Net specification: DMX length is 2..=512 bytes and should be even.
-    // We trim trailing zeros to reduce packet size while staying compliant.
-    // However, if all values are 0, we send a full 512-byte frame for "All 0" functionality.
-    let mut last = 0usize;
-    for (i, v) in data.iter().enumerate() {
-        if *v != 0 {
-            last = i + 1;
-        }
-    }
-    let mut len = if last == 0 {
-        512
-    } else if last < 2 {
-        2
-    } else {
-        last as u16
-    };
-    if len % 2 == 1 {
-        len += 1;
-    } // ensure even length
-    if len > 512 {
-        512
-    } else {
-        len
-    }
-}
-
 pub fn encode_artdmx_into(pkt: &mut Vec<u8>, cfg: &SenderConfig, data: &[u8; 512], sequence: u8) {
-    let length = compute_dmx_length(data);
+    const LENGTH: u16 = 512;
     pkt.clear();
-    pkt.reserve(18 + length as usize);
+    pkt.reserve(18 + LENGTH as usize);
     pkt.extend_from_slice(ARTNET_ID);
     pkt.extend_from_slice(&OP_OUTPUT.to_le_bytes());
     pkt.extend_from_slice(&PROT_VER.to_be_bytes());
@@ -100,8 +73,8 @@ pub fn encode_artdmx_into(pkt: &mut Vec<u8>, cfg: &SenderConfig, data: &[u8; 512
     let subuni = (sub << 4) | uni; // SubUni: hi-nibble SubNet, lo-nibble Universe
     pkt.push(subuni); // SubUni (lo)
     pkt.push(cfg.net & 0x7f); // Net (hi)
-    pkt.extend_from_slice(&length.to_be_bytes()); // Length hi, lo (big-endian)
-    pkt.extend_from_slice(&data[..length as usize]);
+    pkt.extend_from_slice(&LENGTH.to_be_bytes());
+    pkt.extend_from_slice(data);
 }
 
 pub fn encode_artdmx(cfg: &SenderConfig, data: &[u8; 512], sequence: u8) -> Vec<u8> {

@@ -141,6 +141,7 @@ export default function MonitorCanvas() {
   const isUpdatingSizeRef = useRef(false);
   const [universes, setUniverses] = useState<string[]>([]);
   const [selected, setSelected] = useState<string>("");
+  const selectedRef = useRef("");
   const universeLastSeenRef = useRef<Map<string, number>>(new Map());
   const universeSeenCountRef = useRef<Map<string, number>>(new Map());
   const [hoveredChannel, setHoveredChannel] = useState<number | null>(null);
@@ -169,6 +170,10 @@ export default function MonitorCanvas() {
   const [channelValues, setChannelValues] = useState<Uint8Array>(
     new Uint8Array(512)
   );
+
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   // Memoize the mouse position update to prevent unnecessary re-renders
   const handleMouseMove = useCallback(
@@ -341,11 +346,15 @@ export default function MonitorCanvas() {
       universeSeenCountRef.current.set(key, cnt);
       if (cnt >= 2) {
         setUniverses((u) => (u.includes(key) ? u : [...u, key]));
-        if (!selected) setSelected(key);
       }
 
-      // Only update display for the selected universe
-      const target = !selected || key === selected;
+      let activeSelected = selectedRef.current;
+      if (!activeSelected && cnt >= 2) {
+        activeSelected = key;
+        selectedRef.current = key;
+        setSelected(key);
+      }
+      const target = key === activeSelected;
       if (!target) {
         return;
       }
@@ -393,7 +402,9 @@ export default function MonitorCanvas() {
           }
           // Fix selection if removed
           if (selected && !keep.includes(selected)) {
-            setSelected(keep[0] || "");
+            const nextSelected = keep[0] || "";
+            selectedRef.current = nextSelected;
+            setSelected(nextSelected);
           }
         }
         return keep;
@@ -462,7 +473,10 @@ export default function MonitorCanvas() {
             <button
               key={key}
               className={`utab ${active ? "active" : ""}`}
-              onClick={() => setSelected(key)}
+              onClick={() => {
+                selectedRef.current = key;
+                setSelected(key);
+              }}
               title={`Net ${n} / Subnet ${s} / Universe ${u}`}
             >
               {n}/{s}/{u}

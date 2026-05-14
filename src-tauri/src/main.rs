@@ -158,16 +158,18 @@ fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
             if let Ok(header) = serde_json::from_str::<JsonlHeader>(trimmed) {
                 if header.format.is_some() {
                     if !header.channels.is_empty() {
-                        channels = header
+                        let parsed_channels: Vec<usize> = header
                             .channels
                             .into_iter()
-                            .map(|n| n.saturating_sub(1) as usize)
-                            .filter(|n| *n < 512)
+                            .filter(|n| (1..=512).contains(n))
+                            .map(|n| (n - 1) as usize)
                             .collect();
+                        if !parsed_channels.is_empty() {
+                            channels = parsed_channels;
+                        }
                     } else if let Some(ch) = header.channel {
-                        let idx = ch.saturating_sub(1) as usize;
-                        if idx < 512 {
-                            channels = vec![idx];
+                        if (1..=512).contains(&ch) {
+                            channels = vec![(ch - 1) as usize];
                         }
                     }
                     values = channels.iter().map(|_| Vec::new()).collect();
@@ -192,11 +194,18 @@ fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
     }
 
     let mut normalized = Vec::new();
+    let mut normalized_values = Vec::new();
     let mut seen = [false; 512];
-    for ch in channels {
+    for (idx, ch) in channels.into_iter().enumerate() {
         if ch < 512 && !seen[ch] {
             seen[ch] = true;
             normalized.push(ch);
+            normalized_values.push(
+                values
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| vec![0; timestamps.len()]),
+            );
         }
     }
 
@@ -204,26 +213,38 @@ fn parse_jsonl_file(path: &str) -> Result<RecordData, String> {
         timestamps,
         addresses,
         channels: normalized,
-        values,
+        values: normalized_values,
     })
 }
 
 fn record_data_from_wav(data: WavRecordingData) -> RecordData {
-    let channels = data.channels.len();
-    let timestamps_len = data.timestamps.len();
-    let dmx_channels = data
-        .dmx_channels
-        .unwrap_or_else(|| (1..=channels as u16).collect());
+    let WavRecordingData {
+        timestamps,
+        channels: wav_channels,
+        dmx_channels,
+    } = data;
+    let timestamps_len = timestamps.len();
+    let mapped_channels = dmx_channels
+        .filter(|channels| channels.len() == wav_channels.len())
+        .unwrap_or_else(|| (1..=wav_channels.len() as u16).collect());
+    let mut channels = Vec::new();
+    let mut values = Vec::new();
+    let mut seen = [false; 512];
+    for (samples, dmx_channel) in wav_channels.into_iter().zip(mapped_channels) {
+        if (1..=512).contains(&dmx_channel) {
+            let idx = (dmx_channel - 1) as usize;
+            if !seen[idx] {
+                seen[idx] = true;
+                channels.push(idx);
+                values.push(samples);
+            }
+        }
+    }
     RecordData {
-        timestamps: data.timestamps,
+        timestamps,
         addresses: vec![(0, 0, 0); timestamps_len],
-        channels: dmx_channels
-            .into_iter()
-            .map(|ch| ch.saturating_sub(1) as usize)
-            .filter(|ch| *ch < 512)
-            .take(channels)
-            .collect(),
-        values: data.channels,
+        channels,
+        values,
     }
 }
 
@@ -696,6 +717,27 @@ fn save_wav_recording(
 fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
     use std::io::Read;
 
+    fn wav_chunk_bounds(
+        buffer_len: usize,
+        data_start: usize,
+        chunk_size: u32,
+    ) -> Result<(usize, usize), String> {
+        let size = usize::try_from(chunk_size).map_err(|_| "WAV chunk too large".to_string())?;
+        let chunk_end = data_start
+            .checked_add(size)
+            .ok_or_else(|| "WAV chunk size overflow".to_string())?;
+        if chunk_end > buffer_len {
+            return Err("Truncated WAV chunk".to_string());
+        }
+        let next_pos = chunk_end
+            .checked_add(size % 2)
+            .ok_or_else(|| "WAV chunk padding overflow".to_string())?;
+        if next_pos > buffer_len {
+            return Err("Truncated WAV chunk padding".to_string());
+        }
+        Ok((chunk_end, next_pos))
+    }
+
     println!("Loading WAV recording from: {}", path);
 
     let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
@@ -732,7 +774,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
     let mut sample_rate = 44100u32; // Default sample rate
     let mut num_channels = 0u16;
     let mut dmx_channels: Option<Vec<u16>> = None;
-    while pos < buffer.len() - 8 {
+    while pos + 8 <= buffer.len() {
         let chunk_id = &buffer[pos..pos + 4];
         let chunk_size = u32::from_le_bytes([
             buffer[pos + 4],
@@ -741,6 +783,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             buffer[pos + 7],
         ]);
         pos += 8;
+        let (_, next_pos) = wav_chunk_bounds(buffer.len(), pos, chunk_size)?;
 
         if chunk_id == b"fmt " {
             if chunk_size < 16 {
@@ -770,20 +813,26 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
                     bits_per_sample
                 ));
             }
+            if num_channels == 0 {
+                return Err("Invalid WAV channel count".to_string());
+            }
+            if sample_rate == 0 {
+                return Err("Invalid WAV sample rate".to_string());
+            }
 
             println!(
                 "WAV: {} channels, {} Hz, {} bits",
                 num_channels, sample_rate, bits_per_sample
             );
-            pos += chunk_size as usize;
+            pos = next_pos;
             break;
         } else {
-            pos += chunk_size as usize + (chunk_size as usize % 2);
+            pos = next_pos;
         }
     }
 
     // Find data chunk
-    while pos < buffer.len() - 8 {
+    while pos + 8 <= buffer.len() {
         let chunk_id = &buffer[pos..pos + 4];
         let chunk_size = u32::from_le_bytes([
             buffer[pos + 4],
@@ -792,7 +841,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
             buffer[pos + 7],
         ]);
         pos += 8;
-        let chunk_end = pos.saturating_add(chunk_size as usize).min(buffer.len());
+        let (chunk_end, next_pos) = wav_chunk_bounds(buffer.len(), pos, chunk_size)?;
 
         if chunk_id == b"anlc" {
             if let Ok(text) = std::str::from_utf8(&buffer[pos..chunk_end]) {
@@ -809,9 +858,14 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
                             });
                 }
             }
-            pos = chunk_end + (chunk_size as usize % 2);
+            pos = next_pos;
         } else if chunk_id == b"data" {
-            // Read sample data
+            if num_channels == 0 {
+                return Err("Missing valid fmt chunk before data".to_string());
+            }
+            if sample_rate == 0 {
+                return Err("Invalid WAV sample rate".to_string());
+            }
             let num_frames = chunk_size as usize / num_channels as usize;
             let mut timestamps = Vec::new();
             let mut channels = vec![Vec::new(); num_channels as usize];
@@ -836,7 +890,7 @@ fn load_wav_recording(path: String) -> Result<WavRecordingData, String> {
                 dmx_channels,
             });
         } else {
-            pos = chunk_end + (chunk_size as usize % 2);
+            pos = next_pos;
         }
     }
 

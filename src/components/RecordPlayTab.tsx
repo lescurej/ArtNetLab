@@ -625,13 +625,22 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
 
   // Apply backend filter whenever selection changes
   useEffect(() => {
-    if (!selected) return;
-    const [n, s, u] = selected.split("/").map((v) => Number(v) | 0);
-    invoke("set_event_filter", { filter: { net: n, subnet: s, universe: u } });
+    const filter = selected
+      ? (() => {
+          const [net, subnet, universe] = selected
+            .split("/")
+            .map((value) => Number(value) | 0);
+          return { net, subnet, universe };
+        })()
+      : null;
+    invoke("set_event_filter", { filter });
+  }, [selected]);
+
+  useEffect(() => {
     return () => {
       invoke("set_event_filter", { filter: null });
     };
-  }, [selected]);
+  }, []);
 
   // Resize observer
   useEffect(() => {

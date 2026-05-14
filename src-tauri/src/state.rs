@@ -531,9 +531,7 @@ impl AppState {
     pub fn stop_recording(&self) {
         let mut g = self.inner.lock().unwrap();
         g.record_tx = None;
-        if let Some(h) = g.record_task.take() {
-            h.abort();
-        }
+        let _ = g.record_task.take();
     }
 
     // Playback controls
@@ -785,7 +783,7 @@ pub async fn run_sender_task(cfg: SenderConfig, app_state: AppState) -> Result<(
     loop {
         interval.tick().await;
         let (last, seq) = app_state.snapshot_channels_tick_seq();
-        let _ = artnet::send_artdmx_with_buffer(sock.as_ref(), &cfg, &last, seq, &mut pkt).await;
+        artnet::send_artdmx_with_buffer(sock.as_ref(), &cfg, &last, seq, &mut pkt).await?;
     }
 }
 
@@ -888,7 +886,7 @@ pub async fn run_play_task(
                     arr[*ch - 1] = rec.values[idx];
                 }
             }
-            let _ = crate::artnet::send_artdmx(&sock, &send_cfg, &arr, 0).await;
+            crate::artnet::send_artdmx(&sock, &send_cfg, &arr, 0).await?;
         }
         if !loop_playback {
             break;
@@ -906,17 +904,23 @@ pub async fn run_wav_play_task(
     loop_playback: bool,
 ) -> Result<()> {
     let sock = artnet::sender_socket().await?;
-    let dmx_channels: Vec<usize> = wav_data
+    let dmx_channels: Vec<Option<usize>> = wav_data
         .dmx_channels
         .as_ref()
         .filter(|channels| channels.len() == wav_data.channels.len())
         .map(|channels| {
             channels
                 .iter()
-                .map(|ch| ch.saturating_sub(1) as usize)
+                .map(|ch| {
+                    if (1..=512).contains(ch) {
+                        Some((ch - 1) as usize)
+                    } else {
+                        None
+                    }
+                })
                 .collect()
         })
-        .unwrap_or_else(|| (0..wav_data.channels.len()).collect());
+        .unwrap_or_else(|| (0..wav_data.channels.len()).map(Some).collect());
     let mut active_start_ms = start_ms;
     loop {
         let mut last_t: Option<u64> = None;
@@ -936,12 +940,14 @@ pub async fn run_wav_play_task(
 
             let mut arr = [0u8; 512];
             for (source_idx, target_idx) in dmx_channels.iter().enumerate() {
-                if *target_idx < 512 && frame_idx < wav_data.channels[source_idx].len() {
-                    arr[*target_idx] = wav_data.channels[source_idx][frame_idx];
+                if let Some(target_idx) = target_idx {
+                    if *target_idx < 512 && frame_idx < wav_data.channels[source_idx].len() {
+                        arr[*target_idx] = wav_data.channels[source_idx][frame_idx];
+                    }
                 }
             }
 
-            let _ = artnet::send_artdmx(&sock, &cfg, &arr, 0).await;
+            artnet::send_artdmx(&sock, &cfg, &arr, 0).await?;
         }
         if !loop_playback {
             break;

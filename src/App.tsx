@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { DiscoveredNode } from "./artdiscover";
 import "./App.css";
@@ -7,10 +7,10 @@ import SenderTab from "./components/SenderTab";
 import RecordPlayTab from "./components/RecordPlayTab";
 import DiscoverTab from "./components/DiscoverTab";
 
+type AppTab = "monitor" | "sender" | "recplay" | "discover";
+
 function App() {
-  const [tab, setTab] = useState<
-    "monitor" | "sender" | "recplay" | "discover"
-  >("monitor");
+  const [tab, setTab] = useState<AppTab>("monitor");
   const [faders, setFaders] = useState<number[]>(Array(512).fill(0));
   // path handled within RecordPlayTab now
   const [masterValue, setMasterValue] = useState(255);
@@ -223,6 +223,34 @@ function App() {
     ) : null;
 
   const contentScrollRef = useRef<HTMLElement | null>(null);
+  const tabScrollTopRef = useRef<Record<AppTab, number>>({
+    monitor: 0,
+    sender: 0,
+    recplay: 0,
+    discover: 0,
+  });
+
+  const switchTab = useCallback(
+    (nextTab: AppTab) => {
+      const scrollEl = contentScrollRef.current;
+      if (scrollEl) {
+        tabScrollTopRef.current[tab] = scrollEl.scrollTop;
+      }
+      setTab(nextTab);
+    },
+    [tab]
+  );
+
+  useLayoutEffect(() => {
+    const scrollEl = contentScrollRef.current;
+    if (!scrollEl) return;
+    const restore = () => {
+      scrollEl.scrollTop = tabScrollTopRef.current[tab] ?? 0;
+    };
+    restore();
+    const id = requestAnimationFrame(restore);
+    return () => cancelAnimationFrame(id);
+  }, [tab]);
 
   return (
     <div className="app">
@@ -231,25 +259,25 @@ function App() {
         <nav className="tabs">
           <button
             className={`tab ${tab === "monitor" ? "active" : ""}`}
-            onClick={() => setTab("monitor")}
+            onClick={() => switchTab("monitor")}
           >
             Monitor
           </button>
           <button
             className={`tab ${tab === "sender" ? "active" : ""}`}
-            onClick={() => setTab("sender")}
+            onClick={() => switchTab("sender")}
           >
             Sender
           </button>
           <button
             className={`tab ${tab === "recplay" ? "active" : ""}`}
-            onClick={() => setTab("recplay")}
+            onClick={() => switchTab("recplay")}
           >
             Record/Play
           </button>
           <button
             className={`tab ${tab === "discover" ? "active" : ""}`}
-            onClick={() => setTab("discover")}
+            onClick={() => switchTab("discover")}
           >
             Discover
           </button>

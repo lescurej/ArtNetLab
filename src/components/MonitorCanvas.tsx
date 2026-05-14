@@ -201,9 +201,7 @@ export default function MonitorCanvas() {
   // Memoize the history update function
   const updateHistory = useCallback(
     (vals: number[], now: number) => {
-      const len = Math.min(512, vals.length);
-
-      for (let i = 0; i < len; i++) {
+      for (let i = 0; i < 512; i++) {
         let history = channelHistoryRef.current.get(i);
         if (!history) {
           history = {
@@ -215,7 +213,7 @@ export default function MonitorCanvas() {
           channelHistoryRef.current.set(i, history);
         }
 
-        history.values[history.writeIndex] = vals[i] | 0;
+        history.values[history.writeIndex] = i < vals.length ? vals[i] | 0 : 0;
         history.timestamps[history.writeIndex] = now;
         history.writeIndex = (history.writeIndex + 1) % BUFFER_SIZE;
         history.size = Math.min(history.size + 1, BUFFER_SIZE);
@@ -356,8 +354,8 @@ export default function MonitorCanvas() {
 
       // Only update if values actually changed
       let hasChanges = false;
-      for (let i = 0; i < len; i++) {
-        const newVal = vals[i] | 0;
+      for (let i = 0; i < 512; i++) {
+        const newVal = i < len ? vals[i] | 0 : 0;
         if (buf[i] !== newVal) {
           buf[i] = newVal;
           hasChanges = true;

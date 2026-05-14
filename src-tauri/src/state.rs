@@ -845,10 +845,15 @@ pub async fn run_play_task(
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
                     if val.get("format").is_some() {
                         if let Some(arr) = val.get("channels").and_then(|v| v.as_array()) {
-                            channels = arr
+                            let parsed_channels: Vec<usize> = arr
                                 .iter()
-                                .filter_map(|n| n.as_u64().map(|x| x as usize))
+                                .filter_map(|n| n.as_u64())
+                                .filter(|x| (1..=512).contains(x))
+                                .map(|x| x as usize)
                                 .collect();
+                            if !parsed_channels.is_empty() {
+                                channels = parsed_channels;
+                            }
                         }
                         continue;
                     }
@@ -901,6 +906,17 @@ pub async fn run_wav_play_task(
     loop_playback: bool,
 ) -> Result<()> {
     let sock = artnet::sender_socket().await?;
+    let dmx_channels: Vec<usize> = wav_data
+        .dmx_channels
+        .as_ref()
+        .filter(|channels| channels.len() == wav_data.channels.len())
+        .map(|channels| {
+            channels
+                .iter()
+                .map(|ch| ch.saturating_sub(1) as usize)
+                .collect()
+        })
+        .unwrap_or_else(|| (0..wav_data.channels.len()).collect());
     let mut active_start_ms = start_ms;
     loop {
         let mut last_t: Option<u64> = None;
@@ -919,9 +935,9 @@ pub async fn run_wav_play_task(
             last_t = Some(t_ms);
 
             let mut arr = [0u8; 512];
-            for ch in 0..512 {
-                if ch < wav_data.channels.len() && frame_idx < wav_data.channels[ch].len() {
-                    arr[ch] = wav_data.channels[ch][frame_idx];
+            for (source_idx, target_idx) in dmx_channels.iter().enumerate() {
+                if *target_idx < 512 && frame_idx < wav_data.channels[source_idx].len() {
+                    arr[*target_idx] = wav_data.channels[source_idx][frame_idx];
                 }
             }
 

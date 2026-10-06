@@ -1,16 +1,31 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { DiscoveredNode } from "./artdiscover";
 import "./App.css";
-import MonitorCanvas from "./components/MonitorCanvas";
-import SenderTab from "./components/SenderTab";
-import RecordPlayTab from "./components/RecordPlayTab";
-import DiscoverTab from "./components/DiscoverTab";
+
+const MonitorCanvas = lazy(() => import("./components/MonitorCanvas"));
+const SenderTab = lazy(() => import("./components/SenderTab"));
+const RecordPlayTab = lazy(() => import("./components/RecordPlayTab"));
+const DiscoverTab = lazy(() => import("./components/DiscoverTab"));
 
 type AppTab = "monitor" | "sender" | "recplay" | "discover";
 
 function App() {
   const [tab, setTab] = useState<AppTab>("monitor");
+  const [visitedTabs, setVisitedTabs] = useState<Record<AppTab, boolean>>({
+    monitor: true,
+    sender: false,
+    recplay: false,
+    discover: false,
+  });
   const [faders, setFaders] = useState<number[]>(Array(512).fill(0));
   // path handled within RecordPlayTab now
   const [masterValue, setMasterValue] = useState(255);
@@ -236,6 +251,9 @@ function App() {
       if (scrollEl) {
         tabScrollTopRef.current[tab] = scrollEl.scrollTop;
       }
+      setVisitedTabs((prev) =>
+        prev[nextTab] ? prev : { ...prev, [nextTab]: true }
+      );
       setTab(nextTab);
     },
     [tab]
@@ -304,45 +322,49 @@ function App() {
       </header>
 
       <main ref={contentScrollRef} className="content">
-        {/* Monitor */}
-        <section className={`view ${tab === "monitor" ? "active" : ""}`}>
-          <MonitorCanvas />
-        </section>
+        <Suspense fallback={null}>
+          <section className={`view ${tab === "monitor" ? "active" : ""}`}>
+            {visitedTabs.monitor && <MonitorCanvas />}
+          </section>
 
-        {/* Sender (keep mounted so animation continues when hidden) */}
-        <section className={`view ${tab === "sender" ? "active" : ""}`}>
-          <SenderTab
-            scrollParentRef={contentScrollRef}
-            isSenderViewportActive={tab === "sender"}
-            faders={faders}
-            setFaders={setFaders}
-            onFader={onFader}
-            onMomentaryHold={onMomentaryHold}
-            onInputChange={onInputChange}
-            all={all}
-            startSender={startSender}
-            masterValue={masterValue}
-            setMasterValue={setMasterValue}
-            senderRunning={senderRunning}
-          />
-        </section>
+          <section className={`view ${tab === "sender" ? "active" : ""}`}>
+            {visitedTabs.sender && (
+              <SenderTab
+                scrollParentRef={contentScrollRef}
+                isSenderViewportActive={tab === "sender"}
+                faders={faders}
+                setFaders={setFaders}
+                onFader={onFader}
+                onMomentaryHold={onMomentaryHold}
+                onInputChange={onInputChange}
+                all={all}
+                startSender={startSender}
+                masterValue={masterValue}
+                setMasterValue={setMasterValue}
+                senderRunning={senderRunning}
+              />
+            )}
+          </section>
 
-        <section className={`view ${tab === "recplay" ? "active" : ""}`}>
-          <RecordPlayTab />
-        </section>
+          <section className={`view ${tab === "recplay" ? "active" : ""}`}>
+            {visitedTabs.recplay && <RecordPlayTab isActive={tab === "recplay"} />}
+          </section>
 
-        <section className={`view ${tab === "discover" ? "active" : ""}`}>
-          <DiscoverTab
-            onApplyTargetIp={(ip) =>
-              setSndCfg((prev) => ({ ...prev, target_ip: ip }))
-            }
-            discoveryIntervalSec={discoveryIntervalSec}
-            rows={discoveredNodes}
-            scanning={discoveryScanning}
-            error={discoveryError}
-            onScan={(extras, tm) => void performDiscovery(extras, tm)}
-          />
-        </section>
+          <section className={`view ${tab === "discover" ? "active" : ""}`}>
+            {visitedTabs.discover && (
+              <DiscoverTab
+                onApplyTargetIp={(ip) =>
+                  setSndCfg((prev) => ({ ...prev, target_ip: ip }))
+                }
+                discoveryIntervalSec={discoveryIntervalSec}
+                rows={discoveredNodes}
+                scanning={discoveryScanning}
+                error={discoveryError}
+                onScan={(extras, tm) => void performDiscovery(extras, tm)}
+              />
+            )}
+          </section>
+        </Suspense>
       </main>
 
       {/* Monitor settings modal */}

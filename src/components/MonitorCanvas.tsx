@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { Stage, Layer, Rect, Text, Group } from "react-konva";
 import ChannelTooltip from "./ChannelTooltip";
@@ -20,7 +20,7 @@ interface ChannelData {
 }
 
 // Create a memoized channel component with better optimization
-const ChannelComponent = ({
+const ChannelComponent = memo(({
   channel,
   value,
   onMouseEnter,
@@ -65,7 +65,6 @@ const ChannelComponent = ({
         fill="#0f1622"
         stroke="#243146"
         strokeWidth={0.5}
-        cache={{ pixelRatio: 1, hitGraphEnabled: true }}
       />
 
       {/* Value bar */}
@@ -106,7 +105,12 @@ const ChannelComponent = ({
       />
     </Group>
   );
-};
+}, (prev, next) =>
+  prev.value === next.value &&
+  prev.channel === next.channel &&
+  prev.onMouseEnter === next.onMouseEnter &&
+  prev.onMouseLeave === next.onMouseLeave
+);
 
 // Memoize the default channels calculation
 const defaultChannels = (stageWidth: number, stageHeight: number) => {
@@ -146,6 +150,8 @@ export default function MonitorCanvas() {
   const universeSeenCountRef = useRef<Map<string, number>>(new Map());
   const [hoveredChannel, setHoveredChannel] = useState<number | null>(null);
   const currentBufRef = useRef<Uint8Array>(new Uint8Array(512));
+  const pendingChannelValuesRef = useRef<Uint8Array | null>(null);
+  const channelValuesRafRef = useRef<number | null>(null);
   const [mousePos, setMousePos] = useState<{ x: number; y: number }>({
     x: 0,
     y: 0,
@@ -180,13 +186,13 @@ export default function MonitorCanvas() {
     (e: any) => {
       const stage = e.target.getStage();
       const pos = stage.getPointerPosition();
+      if (!pos) return;
 
-      // Only update if position actually changed
-      if (mousePos.x !== pos.x || mousePos.y !== pos.y) {
-        setMousePos({ x: pos.x, y: pos.y });
-      }
+      setMousePos((prev) =>
+        prev.x !== pos.x || prev.y !== pos.y ? { x: pos.x, y: pos.y } : prev
+      );
     },
-    [mousePos.x, mousePos.y]
+    []
   );
 
   // Memoize mouse event handlers
@@ -200,7 +206,23 @@ export default function MonitorCanvas() {
 
   // Memoize the channel values update
   const updateChannels = useCallback((newValues: Uint8Array) => {
-    setChannelValues(newValues);
+    pendingChannelValuesRef.current = newValues;
+    if (channelValuesRafRef.current != null) return;
+    channelValuesRafRef.current = requestAnimationFrame(() => {
+      channelValuesRafRef.current = null;
+      const pending = pendingChannelValuesRef.current;
+      if (!pending) return;
+      pendingChannelValuesRef.current = null;
+      setChannelValues(pending);
+    });
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (channelValuesRafRef.current != null) {
+        cancelAnimationFrame(channelValuesRafRef.current);
+      }
+    };
   }, []);
 
   // Memoize the history update function

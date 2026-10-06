@@ -28,7 +28,9 @@ type WavRecording = {
   dmx_channels?: number[];
 };
 
-interface RecordPlayTabProps {}
+interface RecordPlayTabProps {
+  isActive: boolean;
+}
 
 const CHANNELS = 512;
 const CELL_H = 24;
@@ -36,7 +38,7 @@ const GUTTER_W = 48;
 
 function interpolatedSample(
   vt: readonly number[],
-  vals: Uint8Array,
+  vals: readonly number[],
   t: number
 ): number {
   const n = vt.length;
@@ -66,7 +68,7 @@ function trimVizBeforeTime(
   cutoffMs: number,
   channels: readonly number[],
   vizTRef: { current: number[] },
-  vizBufRef: { current: Uint8Array[] }
+  vizBufRef: { current: number[][] }
 ): void {
   const vt = vizTRef.current;
   const n = vt.length;
@@ -190,7 +192,10 @@ type SenderConfig = {
   universe: number;
 };
 
-export default function RecordPlayTab(_props: RecordPlayTabProps) {
+const createChannelBuffers = () =>
+  Array.from({ length: CHANNELS }, () => [] as number[]);
+
+export default function RecordPlayTab({ isActive }: RecordPlayTabProps) {
   const [universes, setUniverses] = useState<UniverseKey[]>([]);
   const [selected, setSelected] = useState<UniverseKey>("");
   const [isRecording, setIsRecording] = useState(false);
@@ -219,15 +224,11 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
 
   // Data buffers: timestamps and per-channel arrays of values
   const tRef = useRef<number[]>([]);
-  const bufRef = useRef<Uint8Array[]>(
-    Array.from({ length: CHANNELS }, () => new Uint8Array(0))
-  );
+  const bufRef = useRef<number[][]>(createChannelBuffers());
 
   // Visualization data (downsampled for performance)
   const vizTRef = useRef<number[]>([]);
-  const vizBufRef = useRef<Uint8Array[]>(
-    Array.from({ length: CHANNELS }, () => new Uint8Array(0))
-  );
+  const vizBufRef = useRef<number[][]>(createChannelBuffers());
 
   const MAX_VIZ_FRAMES = 2000;
   const SAMPLE_RATE = 1;
@@ -254,10 +255,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   const resetVisualization = useCallback(() => {
     incomingSeqRef.current = 0;
     vizTRef.current = [];
-    vizBufRef.current = Array.from(
-      { length: CHANNELS },
-      () => new Uint8Array(0)
-    );
+    vizBufRef.current = createChannelBuffers();
   }, []);
 
   const draw = useCallback(() => {
@@ -476,6 +474,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
   }, []);
 
   useEffect(() => {
+    if (!isActive) return;
     let unlisten: Promise<UnlistenFn> | null = null;
     unlisten = listen<Frame>("artnet:dmx", (e) => {
       const p = e.payload;
@@ -488,10 +487,11 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     return () => {
       unlisten?.then((fn) => fn());
     };
-  }, []);
+  }, [isActive]);
 
   // Universe data capture
   useEffect(() => {
+    if (!isActive && !isRecording) return;
     let unlisten: Promise<UnlistenFn> | null = null;
     unlisten = listen<Frame>("artnet:dmx_filtered", (e) => {
       const p = e.payload;
@@ -508,19 +508,16 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         tRef.current.push(stamp);
         recordChannels.forEach((ch) => {
           const chIdx = Math.min(Math.max(ch - 1, 0), CHANNELS - 1);
-          const v = values[chIdx] | 0;
-          const prev = bufRef.current[chIdx];
-          const next = new Uint8Array(prev.length + 1);
-          if (prev.length) next.set(prev, 0);
-          next[prev.length] = v;
-          bufRef.current[chIdx] = next;
+          bufRef.current[chIdx].push(values[chIdx] | 0);
         });
 
         if (tRef.current.length > MAX_COMPLETE_FRAMES) {
           const keep = Math.floor(MAX_COMPLETE_FRAMES * 0.5);
           tRef.current = tRef.current.slice(-keep);
           for (let ch = 0; ch < CHANNELS; ch++) {
-            bufRef.current[ch] = bufRef.current[ch].slice(-keep);
+            if (bufRef.current[ch].length > keep) {
+              bufRef.current[ch] = bufRef.current[ch].slice(-keep);
+            }
           }
         }
       }
@@ -533,12 +530,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         vizTRef.current.push(stamp);
         waveformRows.forEach((dmx) => {
           const chIdx = Math.min(Math.max(dmx - 1, 0), CHANNELS - 1);
-          const v = values[chIdx] | 0;
-          const prev = vizBufRef.current[chIdx];
-          const next = new Uint8Array(prev.length + 1);
-          if (prev.length) next.set(prev, 0);
-          next[prev.length] = v;
-          vizBufRef.current[chIdx] = next;
+          vizBufRef.current[chIdx].push(values[chIdx] | 0);
         });
       }
 
@@ -563,13 +555,13 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     };
   }, [
     isRecording,
-    selected,
-    draw,
+    isActive,
     recordChannels,
     waveformRows,
   ]);
 
   useEffect(() => {
+    if (!isActive) return;
     if (isRecording) return;
     if (frozenVizEndRef.current != null) return;
     trimVizBeforeTime(
@@ -578,9 +570,10 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       vizTRef,
       vizBufRef
     );
-  }, [isRecording, waveformRows]);
+  }, [isActive, isRecording, waveformRows]);
 
   useEffect(() => {
+    if (!isActive && !isPlaying) return;
     const tick = () => {
       draw();
       drawRafRef.current = requestAnimationFrame(tick);
@@ -591,10 +584,11 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         cancelAnimationFrame(drawRafRef.current);
       }
     };
-  }, [draw]);
+  }, [draw, isActive, isPlaying]);
 
   // TTL prune universes and control blink state for selected
   useEffect(() => {
+    if (!isActive) return;
     const id = window.setInterval(() => {
       const now = Date.now();
       setUniverses((prev) => {
@@ -621,7 +615,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       }
     }, 250);
     return () => window.clearInterval(id);
-  }, [selected]);
+  }, [isActive, selected]);
 
   // Apply backend filter whenever selection changes
   useEffect(() => {
@@ -644,16 +638,18 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
 
   // Resize observer
   useEffect(() => {
+    if (!isActive) return;
     const ro = new ResizeObserver(() => {
       if (!containerRef.current) return;
       requestAnimationFrame(draw);
     });
     if (containerRef.current) ro.observe(containerRef.current);
     return () => ro.disconnect();
-  }, []);
+  }, [draw, isActive]);
 
   // Ensure scroll updates are captured reliably (WebKit/WebView fallback)
   useEffect(() => {
+    if (!isActive) return;
     const el = containerRef.current;
     if (!el) return;
     const onScroll = () => {
@@ -663,7 +659,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => el.removeEventListener("scroll", onScroll);
-  }, [draw]);
+  }, [draw, isActive]);
 
   // Drawing
 
@@ -693,7 +689,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     let loadedKey: UniverseKey | "" = "";
     let vizChannelNums: number[] = [];
     let nextT: number[] = [];
-    let nextBuf = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
+    let nextBuf = createChannelBuffers();
 
     try {
       if (isWavFile) {
@@ -717,9 +713,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
         vizChannelNums.forEach((dmx, idx) => {
           const chIdx = dmx - 1;
           const values = wav.channels[idx] || [];
-          nextBuf[chIdx] = new Uint8Array(
-            values.map((value) => Number(value) | 0)
-          );
+          nextBuf[chIdx] = values.map((value) => Number(value) | 0);
         });
       } else {
         const content = (await invoke("read_text_file", {
@@ -749,11 +743,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
           vizChannelNums.forEach((dmx, idx) => {
             const ch = dmx - 1;
             const v = Number(values[idx]) | 0;
-            const prev = nextBuf[ch];
-            const next = new Uint8Array(prev.length + 1);
-            if (prev.length) next.set(prev);
-            next[prev.length] = v;
-            nextBuf[ch] = next;
+            nextBuf[ch].push(v);
           });
         }
       }
@@ -802,15 +792,9 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
       frozenVizEndRef.current = null;
       incomingSeqRef.current = 0;
       tRef.current = [];
-      bufRef.current = Array.from(
-        { length: CHANNELS },
-        () => new Uint8Array(0)
-      );
+      bufRef.current = createChannelBuffers();
       vizTRef.current = [];
-      vizBufRef.current = Array.from(
-        { length: CHANNELS },
-        () => new Uint8Array(0)
-      );
+      vizBufRef.current = createChannelBuffers();
       setIsRecording(true);
     } else {
       frozenVizEndRef.current =
@@ -1073,7 +1057,7 @@ export default function RecordPlayTab(_props: RecordPlayTabProps) {
     playbackStartRef.current = null;
     resetVisualization();
     tRef.current = [];
-    bufRef.current = Array.from({ length: CHANNELS }, () => new Uint8Array(0));
+    bufRef.current = createChannelBuffers();
     requestAnimationFrame(draw);
   }, [draw, resetVisualization]);
 

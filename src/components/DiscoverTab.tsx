@@ -22,7 +22,7 @@ export default function DiscoverTab({
   onScan,
 }: DiscoverTabProps) {
   const [extraBroadcasts, setExtraBroadcasts] = useState("");
-  const [timeoutMs, setTimeoutMs] = useState(2000);
+  const [timeoutMs, setTimeoutMs] = useState(4000);
 
   return (
     <section className="discover-pane">
@@ -38,11 +38,11 @@ export default function DiscoverTab({
           {scanning ? "Scanning…" : "Scan network"}
         </button>
         <label className="discover-label">
-          Extra broadcast IPs
+          Extra poll targets (broadcast or node IP)
           <input
             type="text"
             className="discover-input"
-            placeholder="e.g. 192.168.1.255"
+            placeholder="broadcast or node IP, comma-separated"
             value={extraBroadcasts}
             onChange={(e) => setExtraBroadcasts(e.currentTarget.value)}
           />
@@ -65,8 +65,8 @@ export default function DiscoverTab({
           {discoveryIntervalSec > 0
             ? `Auto-discovery every ${discoveryIntervalSec}s (change in Monitor or Sender ⚙)`
             : "Auto-discovery off (interval 0 in settings)"}{" "}
-          · Targets include interface broadcasts, sender target IP, 255.255.255.255, and extras
-          below.
+          · Use a unicast node IP in Sender if the node ignores broadcast ArtPoll.
+          Extras accept subnet broadcast or unicast node IPs.
         </span>
       </div>
       {error && <div className="discover-error">{error}</div>}

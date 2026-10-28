@@ -12,6 +12,7 @@ import {
   open as dialogOpen,
   save as dialogSave,
 } from "@tauri-apps/plugin-dialog";
+import { universeFieldHint } from "../artnetUniverse";
 
 type Frame = {
   values: number[];
@@ -1346,7 +1347,7 @@ export default function RecordPlayTab({ isActive }: RecordPlayTabProps) {
               />
             </div>
             <div className="row">
-              <label>Universe</label>
+              <label>Universe (Art-Net 0–15)</label>
               <input
                 type="number"
                 min={0}
@@ -1360,6 +1361,7 @@ export default function RecordPlayTab({ isActive }: RecordPlayTabProps) {
                 }
               />
             </div>
+            <p className="field-hint">{universeFieldHint(settings.universe)}</p>
             <div className="actions">
               <button className="btn" onClick={saveSettings}>
                 Save

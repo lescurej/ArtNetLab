@@ -530,6 +530,52 @@ body::before {
   flex: 1 1 260px;
   max-width: 420px;
 }
+
+.rdm-layout {
+  display: grid;
+  grid-template-columns: 1fr minmax(220px, 280px);
+  gap: var(--space-4);
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .rdm-layout { grid-template-columns: 1fr; }
+}
+.rdm-table-wrap { min-height: 200px; }
+.rdm-row-selected td { background: rgba(142, 163, 189, 0.12); }
+.rdm-config {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  padding: var(--space-4);
+}
+.rdm-config-title {
+  margin: 0 0 var(--space-3);
+  font-size: 14px;
+  font-weight: 600;
+}
+.rdm-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-bottom: var(--space-3);
+  font-size: 12px;
+}
+.rdm-field-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+.rdm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+.rdm-status {
+  color: #a8c4a0;
+  font-size: 13px;
+  margin-bottom: var(--space-3);
+}
 .field-hint {
   font-size: 11px;
   color: var(--muted);

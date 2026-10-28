@@ -9,14 +9,16 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { DiscoveredNode } from "./artdiscover";
+import { universeFieldHint } from "./artnetUniverse";
 import "./App.css";
 
 const MonitorCanvas = lazy(() => import("./components/MonitorCanvas"));
 const SenderTab = lazy(() => import("./components/SenderTab"));
 const RecordPlayTab = lazy(() => import("./components/RecordPlayTab"));
 const DiscoverTab = lazy(() => import("./components/DiscoverTab"));
+const RdmTab = lazy(() => import("./components/RdmTab"));
 
-type AppTab = "monitor" | "sender" | "recplay" | "discover";
+type AppTab = "monitor" | "sender" | "recplay" | "discover" | "rdm";
 
 function App() {
   const [tab, setTab] = useState<AppTab>("monitor");
@@ -25,6 +27,7 @@ function App() {
     sender: false,
     recplay: false,
     discover: false,
+    rdm: false,
   });
   const [faders, setFaders] = useState<number[]>(Array(512).fill(0));
   // path handled within RecordPlayTab now
@@ -243,6 +246,7 @@ function App() {
     sender: 0,
     recplay: 0,
     discover: 0,
+    rdm: 0,
   });
 
   const switchTab = useCallback(
@@ -298,6 +302,12 @@ function App() {
             onClick={() => switchTab("discover")}
           >
             Discover
+          </button>
+          <button
+            className={`tab ${tab === "rdm" ? "active" : ""}`}
+            onClick={() => switchTab("rdm")}
+          >
+            RDM
           </button>
         </nav>
         <div className="spacer" />
@@ -361,6 +371,18 @@ function App() {
                 scanning={discoveryScanning}
                 error={discoveryError}
                 onScan={(extras, tm) => void performDiscovery(extras, tm)}
+              />
+            )}
+          </section>
+
+          <section className={`view ${tab === "rdm" ? "active" : ""}`}>
+            {visitedTabs.rdm && (
+              <RdmTab
+                targetIp={sndCfg.target_ip}
+                port={sndCfg.port}
+                net={sndCfg.net}
+                subnet={sndCfg.subnet}
+                universe={sndCfg.universe}
               />
             )}
           </section>
@@ -500,7 +522,7 @@ function App() {
             />
           </div>
           <div className="row">
-            <label>Universe</label>
+            <label>Universe (Art-Net 0–15)</label>
             <input
               type="number"
               min={0}
@@ -514,6 +536,7 @@ function App() {
               }
             />
           </div>
+          <p className="field-hint">{universeFieldHint(sndCfg.universe)}</p>
           <div className="row">
             <label>Discovery interval (sec)</label>
             <input

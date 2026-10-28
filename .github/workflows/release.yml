@@ -15,6 +15,7 @@ jobs:
     env:
       MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
       MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,10 +65,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux build dependencies
-        if: ${{ matrix.platform == 'ubuntu-latest' }}
+        if: matrix.platform == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          # Try webkit2gtk 4.1, fall back to 4.0 if unavailable
           sudo apt-get install -y \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
@@ -82,25 +82,54 @@ jobs:
             libwebkit2gtk-4.0-dev
 
       - name: Install WiX Toolset (Windows)
-        if: ${{ matrix.platform == 'windows-latest' }}
+        if: matrix.platform == 'windows-latest'
         run: choco install wixtoolset -y
 
       - name: Import Apple code-signing certificate (macOS)
-        if: ${{ runner.os == 'macOS' && env.MACOS_CERT_P12 != '' && env.MACOS_CERT_PASSWORD != '' }}
+        if: runner.os == 'macOS' && env.MACOS_CERT_P12 != '' && env.MACOS_CERT_PASSWORD != ''
         uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ env.MACOS_CERT_P12 }}
           p12-password: ${{ env.MACOS_CERT_PASSWORD }}
 
-      - name: List available code signing identities (macOS)
-        if: ${{ runner.os == 'macOS' }}
-        run: security find-identity -v -p codesigning || true
+      - name: Configure macOS bundle and notarization flags
+        if: runner.os == 'macOS'
+        id: macos_release
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          NOTARIZE=false
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            NOTARIZE=true
+          fi
+          echo "notarize=$NOTARIZE" >> "$GITHUB_OUTPUT"
 
-      - name: Build and upload release artifacts with Tauri
+          SIGN=false
+          IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
+          if [ -z "$IDENTITY" ] && [ -n "${MACOS_CERT_P12:-}" ]; then
+            IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Developer ID Application/{print $2; exit}')
+          fi
+          if [ -n "$IDENTITY" ]; then
+            SIGN=true
+            echo "MACOS_SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          fi
+          if [ "$SIGN" = true ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+            export ENABLE_MACOS_SIGN=1
+          else
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+            export ENABLE_MACOS_SIGN=0
+          fi
+          node scripts/configure-macos-bundle.mjs
+
+      - name: Build and upload release (macOS, with notarization)
+        if: runner.os != 'macOS' || steps.macos_release.outputs.notarize == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          # macOS notarization (optional, macOS only)
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -110,6 +139,22 @@ jobs:
           releaseBody: |
             Automated release for ${{ github.ref_name }}.
             Assets include macOS (DMG), Windows, and Linux bundles.
+          releaseDraft: false
+          prerelease: false
+          tauriScript: pnpm tauri
+
+      - name: Build and upload release (macOS, notarization skipped)
+        if: runner.os == 'macOS' && steps.macos_release.outputs.notarize != 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Artnetlab ${{ github.ref_name }}
+          releaseBody: |
+            Automated release for ${{ github.ref_name }}.
+            Assets include macOS (DMG), Windows, and Linux bundles.
+            macOS build is unsigned or signed-only (not notarized) when Apple notarization secrets are not configured.
           releaseDraft: false
           prerelease: false
           tauriScript: pnpm tauri

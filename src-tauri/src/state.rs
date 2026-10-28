@@ -329,7 +329,9 @@ fn normalize_channels(channels: Vec<usize>) -> Vec<usize> {
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     shared_udp: Arc<tokio::sync::Mutex<Option<Arc<UdpSocket>>>>,
-    discovery_poll_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<(SocketAddr, Vec<u8>)>>>>,
+    discovery_poll_tx: Arc<
+        tokio::sync::Mutex<Option<mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>>,
+    >,
 }
 
 struct Inner {
@@ -387,7 +389,7 @@ impl AppState {
 
     pub async fn set_discovery_poll_reply_tx(
         &self,
-        tx: Option<mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+        tx: Option<mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>>,
     ) {
         *self.discovery_poll_tx.lock().await = tx;
     }
@@ -763,10 +765,10 @@ pub async fn run_receiver_task(
             }
         } else if n >= 10 && &buf[..8] == b"Art-Net\0" {
             let op = u16::from_le_bytes([buf[8], buf[9]]);
-            if op == 0x2100 {
+            if matches!(op, 0x2100 | 0x8100 | 0x8300) {
                 let gate = app_state.discovery_poll_tx.lock().await;
                 if let Some(ref tx) = *gate {
-                    let _ = tx.try_send((from, buf[..n].to_vec()));
+                    let _ = tx.send((from, buf[..n].to_vec()));
                 }
             }
         }

@@ -2,6 +2,7 @@
 
 mod artnet;
 mod discovery;
+mod rdm;
 mod state;
 
 use std::{collections::HashSet, fs, path::PathBuf};
@@ -996,6 +997,61 @@ fn stop_animation(state: tauri::State<AppState>) {
 }
 
 #[tauri::command]
+async fn rdm_scan(
+    state: tauri::State<'_, AppState>,
+    cfg: artnet::SenderConfig,
+    port_index: u8,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<rdm::RdmFixture>, String> {
+    let timeout_ms = timeout_ms.unwrap_or(5000);
+    state.stop_sender();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut relay = Some(rx);
+    state.set_discovery_poll_reply_tx(Some(tx)).await;
+    let out = rdm::scan_fixtures(&cfg, port_index, timeout_ms, &mut relay)
+        .await
+        .map_err(|e| e.to_string());
+    state.set_discovery_poll_reply_tx(None).await;
+    out
+}
+
+#[tauri::command]
+async fn rdm_set_dmx_address(
+    state: tauri::State<'_, AppState>,
+    cfg: artnet::SenderConfig,
+    port_index: u8,
+    uid: String,
+    address: u16,
+) -> Result<u16, String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut relay = Some(rx);
+    state.set_discovery_poll_reply_tx(Some(tx)).await;
+    let out = rdm::set_dmx_address(&cfg, port_index, &uid, address, &mut relay)
+        .await
+        .map_err(|e| e.to_string());
+    state.set_discovery_poll_reply_tx(None).await;
+    out
+}
+
+#[tauri::command]
+async fn rdm_identify(
+    state: tauri::State<'_, AppState>,
+    cfg: artnet::SenderConfig,
+    port_index: u8,
+    uid: String,
+    on: bool,
+) -> Result<(), String> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut relay = Some(rx);
+    state.set_discovery_poll_reply_tx(Some(tx)).await;
+    let out = rdm::set_identify(&cfg, port_index, &uid, on, &mut relay)
+        .await
+        .map_err(|e| e.to_string());
+    state.set_discovery_poll_reply_tx(None).await;
+    out
+}
+
+#[tauri::command]
 async fn artnet_discover(
     state: tauri::State<'_, AppState>,
     cfg: artnet::SenderConfig,
@@ -1017,7 +1073,7 @@ async fn artnet_discover(
     let mut uniq = HashSet::new();
     broadcast_hosts.retain(|s| uniq.insert(s.clone()));
 
-    let (tx, rx) = mpsc::channel(256);
+    let (tx, rx) = mpsc::unbounded_channel();
     let mut relay_slot = Some(rx);
     state.set_discovery_poll_reply_tx(Some(tx)).await;
     let out = discovery::scan_artnet(&broadcast_hosts, port, timeout_ms, &mut relay_slot)
@@ -1089,7 +1145,10 @@ fn main() {
             save_wav_recording,
             load_wav_recording,
             play_wav_file,
-            artnet_discover
+            artnet_discover,
+            rdm_scan,
+            rdm_set_dmx_address,
+            rdm_identify
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
